@@ -311,10 +311,11 @@ jobs:
           echo "RELEASE_TAG=$TAG" >> $GITHUB_ENV
 
       - name: Upload Images to Release
-        uses: softprops/action-gh-release@v3
-        with:
-          files: ./images/*.qcow2
-          name: "PVE Cloud Images ${{ env.RELEASE_TAG }}"
-          tag_name: ${{ env.RELEASE_TAG }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # gh release create publishes immediately; softprops/action-gh-release
+          # can leave the release stuck as an untagged draft (observed 2026-08-01).
+          gh release create "$RELEASE_TAG" ./images/*.qcow2 \
+            --title "PVE Cloud Images $RELEASE_TAG" \
+            --notes "Proxmox VE cloud images for $RELEASE_TAG (debian-12/13, ubuntu-22.04/24.04/26.04)"
