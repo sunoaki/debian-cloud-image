@@ -177,16 +177,27 @@ jobs:
           RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
         run: |
           set -euo pipefail
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+          # The release job has no checkout, so gh cannot infer the repo from
+          # git; always pass -R explicitly (observed failure 2026-08-01:
+          # "failed to run git: not a git repository").
+          if gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Deleting previous release $RELEASE_TAG"
-            gh release delete "$RELEASE_TAG" --yes --cleanup-tag
+            gh release delete "$RELEASE_TAG" --yes --cleanup-tag -R "$GITHUB_REPOSITORY"
           else
             # Remove a bare leftover tag (an earlier build may have been interrupted).
             gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${RELEASE_TAG}" >/dev/null 2>&1 || true
           fi
+          # Also purge orphan drafts (no tag) left behind by an interrupted run.
+          gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+            --jq '.[] | select(.draft == true and .tag_name == "") | .id' |
+            while read -r draft_id; do
+              echo "Deleting orphan draft release $draft_id"
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/${draft_id}" >/dev/null
+            done
           # gh release create publishes immediately; softprops/action-gh-release
           # can leave the release stuck as an untagged draft (observed 2026-08-01).
           gh release create "$RELEASE_TAG" ./images/*.qcow2 \
+            -R "$GITHUB_REPOSITORY" \
             --title "PVE Cloud Images $RELEASE_TAG" \
             --notes "Proxmox VE cloud images for $RELEASE_TAG (debian-12/13, ubuntu-22.04/24.04/26.04)"
 
