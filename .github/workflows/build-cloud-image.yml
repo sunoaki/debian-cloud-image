@@ -2,6 +2,10 @@ name: Build Cloud Images
 
 on:
   workflow_dispatch:
+  schedule:
+    # 每周日 UTC 02:17（北京时间周日 10:17）构建一次最新版本。
+    # 避开整点/半点，release 按日期 tag，同日重建会先删旧再发布。
+    - cron: "17 2 * * 0"
 
 permissions:
   contents: write
