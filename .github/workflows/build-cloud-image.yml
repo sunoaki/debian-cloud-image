@@ -84,16 +84,34 @@ jobs:
           IMAGE_NAME="${{ matrix.image_name }}"
           RELEASE_NAME="${{ matrix.distro }}-${{ matrix.major }}-pve-sunoaki+${RELEASE_TAG}.qcow2"
 
+          # Download with retries: cloud.debian.org is GeoDNS-fronted and
+          # picks different mirrors per runner egress IP; freshly published
+          # releases can have lagging mirrors. Avoid -qO- through a pipe so a
+          # failing wget never SIGPIPEs or swallows its error output.
+          fetch_retry() {
+            local url="$1" out="$2" attempt=1
+            until wget --tries=3 --retry-connrefused --waitretry=2 -O "$out" "$url" 2>&1; do
+              if [ "$attempt" -ge 5 ]; then
+                echo "Download failed after $attempt attempts: $url" >&2
+                return 1
+              fi
+              echo "Attempt $attempt failed, retrying in 5s: $url" >&2
+              sleep 5
+              attempt=$((attempt + 1))
+            done
+          }
+
           # Exact checksum lookup ($2 == file or "$2 == *file"), fail loudly
           # instead of grepping with regex/substring surprises.
-          image_sha="$(wget -qO- "${BASE_URL}/${SHA_FILE}" | awk -v f="$IMAGE_NAME" '$2 == f || $2 == "*" f { print $1; exit }')"
+          fetch_retry "${BASE_URL}/${SHA_FILE}" "sha512.sum"
+          image_sha="$(awk -v f="$IMAGE_NAME" '$2 == f || $2 == "*" f { print $1; exit }' sha512.sum)"
           [ -n "$image_sha" ] || {
             echo "Checksum entry not found for ${IMAGE_NAME}" >&2
             exit 1
           }
 
           echo "Downloading image..."
-          wget "${BASE_URL}/${IMAGE_NAME}" -O "$IMAGE_NAME"
+          fetch_retry "${BASE_URL}/${IMAGE_NAME}" "$IMAGE_NAME"
           dl_sha="$(${HASH_CMD} "$IMAGE_NAME" | awk '{print $1}')"
           [ "$dl_sha" = "$image_sha" ] || {
             echo "Downloaded image checksum mismatch!" >&2
