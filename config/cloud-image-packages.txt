@@ -1,0 +1,25 @@
+# Packages installed into every PVE cloud image (one per line, # comments allowed)
+qemu-guest-agent
+spice-vdagent
+aria2
+net-tools
+iputils-ping
+iputils-arping
+iputils-tracepath
+mtr-tiny
+dnsutils
+sudo
+bash-completion
+unzip
+wget
+curl
+nano
+most
+screen
+less
+vim
+bzip2
+lldpd
+htop
+zstd
+tmux

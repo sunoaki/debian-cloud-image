@@ -1,0 +1,63 @@
+# Cloud image build matrix - one entry per distro release.
+# Consumed by the `generate-matrix` job in build-cloud-images.yml.
+# Add a new distro by appending an entry here (and a PVE template VMID in
+# update-cloud-templates.sh on the PVE side).
+#
+# sources_format:
+#   deb822 = /etc/apt/sources.list.d/*.sources (Debian 12+ / Ubuntu 24.04+)
+#   legacy = /etc/apt/sources.list single-line deb format (Ubuntu 22.04)
+images:
+  - distro: debian
+    codename: trixie
+    major: "13"
+    base_url: https://cloud.debian.org/images/cloud/trixie/latest
+    image_name: debian-13-genericcloud-amd64.qcow2
+    sha_file: SHA512SUMS
+    hash_cmd: sha512sum
+    sources_file: /etc/apt/sources.list.d/debian.sources
+    cloud_cfg: /etc/cloud/cloud.cfg.d/01_debian_cloud.cfg
+    sources_format: deb822
+
+  - distro: debian
+    codename: bookworm
+    major: "12"
+    base_url: https://cloud.debian.org/images/cloud/bookworm/latest
+    image_name: debian-12-genericcloud-amd64.qcow2
+    sha_file: SHA512SUMS
+    hash_cmd: sha512sum
+    sources_file: /etc/apt/sources.list.d/debian.sources
+    cloud_cfg: /etc/cloud/cloud.cfg.d/01_debian_cloud.cfg
+    sources_format: deb822
+
+  - distro: ubuntu
+    codename: resolute
+    major: "26.04"
+    base_url: https://cloud-images.ubuntu.com/resolute/current
+    image_name: resolute-server-cloudimg-amd64.img
+    sha_file: SHA256SUMS
+    hash_cmd: sha256sum
+    sources_file: /etc/apt/sources.list.d/ubuntu.sources
+    cloud_cfg: /etc/cloud/cloud.cfg.d/99-fake_cloud.cfg
+    sources_format: deb822
+
+  - distro: ubuntu
+    codename: noble
+    major: "24.04"
+    base_url: https://cloud-images.ubuntu.com/noble/current
+    image_name: noble-server-cloudimg-amd64.img
+    sha_file: SHA256SUMS
+    hash_cmd: sha256sum
+    sources_file: /etc/apt/sources.list.d/ubuntu.sources
+    cloud_cfg: /etc/cloud/cloud.cfg.d/99-fake_cloud.cfg
+    sources_format: deb822
+
+  - distro: ubuntu
+    codename: jammy
+    major: "22.04"
+    base_url: https://cloud-images.ubuntu.com/jammy/current
+    image_name: jammy-server-cloudimg-amd64.img
+    sha_file: SHA256SUMS
+    hash_cmd: sha256sum
+    sources_file: /etc/apt/sources.list
+    cloud_cfg: /etc/cloud/cloud.cfg.d/99-fake_cloud.cfg
+    sources_format: legacy

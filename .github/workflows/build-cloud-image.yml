@@ -2,77 +2,71 @@ name: Build Cloud Images
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 可选；格式 YYYYMMDD。留空则使用当前 UTC 日期
+        required: false
+        type: string
   schedule:
     # 每周日 UTC 02:17（北京时间周日 10:17）构建一次最新版本。
     # 避开整点/半点，release 按日期 tag，同日重建会先删旧再发布。
     - cron: "17 2 * * 0"
 
+# Only the release job needs write access; keep it scoped there.
 permissions:
-  contents: write
+  contents: read
+
+# Same-day manual rebuilds queue behind each other instead of racing to
+# delete/re-create the same release tag.
+concurrency:
+  group: cloud-images-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build:
+  # Read config/images.yaml (single source of truth for the distro matrix).
+  generate-matrix:
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false  # 单个发行版失败不拖累其他构建
-      matrix:
-        # 新增发行版只需在 include 里加一行。sources_format:
-        # deb822 = /etc/apt/sources.list.d/*.sources (Debian 12+ / Ubuntu 24.04+)
-        # legacy = /etc/apt/sources.list 单行 deb 格式 (Ubuntu 22.04)
-        include:
-          - distro: debian
-            codename: trixie
-            major: "13"
-            base_url: https://cloud.debian.org/images/cloud/trixie/latest
-            image_name: debian-13-genericcloud-amd64.qcow2
-            sha_file: SHA512SUMS
-            hash_cmd: sha512sum
-            sources_file: /etc/apt/sources.list.d/debian.sources
-            cloud_cfg: /etc/cloud/cloud.cfg.d/01_debian_cloud.cfg
-            sources_format: deb822
-          - distro: debian
-            codename: bookworm
-            major: "12"
-            base_url: https://cloud.debian.org/images/cloud/bookworm/latest
-            image_name: debian-12-genericcloud-amd64.qcow2
-            sha_file: SHA512SUMS
-            hash_cmd: sha512sum
-            sources_file: /etc/apt/sources.list.d/debian.sources
-            cloud_cfg: /etc/cloud/cloud.cfg.d/01_debian_cloud.cfg
-            sources_format: deb822
-          - distro: ubuntu
-            codename: resolute
-            major: "26.04"
-            base_url: https://cloud-images.ubuntu.com/resolute/current
-            image_name: resolute-server-cloudimg-amd64.img
-            sha_file: SHA256SUMS
-            hash_cmd: sha256sum
-            sources_file: /etc/apt/sources.list.d/ubuntu.sources
-            cloud_cfg: /etc/cloud/cloud.cfg.d/99-fake_cloud.cfg
-            sources_format: deb822
-          - distro: ubuntu
-            codename: noble
-            major: "24.04"
-            base_url: https://cloud-images.ubuntu.com/noble/current
-            image_name: noble-server-cloudimg-amd64.img
-            sha_file: SHA256SUMS
-            hash_cmd: sha256sum
-            sources_file: /etc/apt/sources.list.d/ubuntu.sources
-            cloud_cfg: /etc/cloud/cloud.cfg.d/99-fake_cloud.cfg
-            sources_format: deb822
-          - distro: ubuntu
-            codename: jammy
-            major: "22.04"
-            base_url: https://cloud-images.ubuntu.com/jammy/current
-            image_name: jammy-server-cloudimg-amd64.img
-            sha_file: SHA256SUMS
-            hash_cmd: sha256sum
-            sources_file: /etc/apt/sources.list
-            cloud_cfg: /etc/cloud/cloud.cfg.d/99-fake_cloud.cfg
-            sources_format: legacy
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Emit matrix JSON
+        id: matrix
+        run: |
+          echo "matrix=$(ruby -ryaml -rjson -e 'puts JSON.generate(YAML.load_file("config/images.yaml")["images"])')" >> "$GITHUB_OUTPUT"
+
+  # Compute the release tag once so build and release agree even across a UTC
+  # midnight rollover, and allow a manual override for re-runs.
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+    steps:
+      - name: Resolve release tag
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-$(date -u +%Y%m%d)}"
+          [[ "$tag" =~ ^[0-9]{8}$ ]] || {
+            echo "release_tag must be YYYYMMDD, got: $tag" >&2
+            exit 1
+          }
+          echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: [generate-matrix, prepare]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false # 单个发行版失败不拖累其他构建
+      matrix:
+        include: ${{ fromJSON(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install dependencies
         run: |
@@ -80,242 +74,132 @@ jobs:
           sudo apt-get install -y qemu-utils parted cloud-guest-utils wget
 
       - name: Download Cloud Image with checksum
-        run: |
-          IMAGE_URL="${{ matrix.base_url }}/${{ matrix.image_name }}"
-          IMAGE_NAME="${{ matrix.image_name }}"
-          IMAGE_SHA="$(wget -qO- ${{ matrix.base_url }}/${{ matrix.sha_file }} | grep "$IMAGE_NAME" | awk '{print $1}')"
-          BUILD_DATE=$(date +%Y%m%d)
-          RELEASE_NAME="${{ matrix.distro }}-${{ matrix.major }}-pve-sunoaki+${BUILD_DATE}.qcow2"
-
-          echo "Downloading image..."
-          wget "$IMAGE_URL" -O "$IMAGE_NAME"
-          DL_SHA=$(${{ matrix.hash_cmd }} "$IMAGE_NAME" | awk '{print $1}')
-          if [ "$DL_SHA" != "$IMAGE_SHA" ]; then
-            echo "Downloaded image checksum mismatch!" >&2
-            exit 1
-          fi
-          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_ENV
-          echo "RELEASE_NAME=$RELEASE_NAME" >> $GITHUB_ENV
-
-      - name: Cache apt packages
-        uses: actions/cache@v4
-        with:
-          path: .apt-cache
-          key: apt-pkgs-${{ matrix.distro }}-${{ matrix.major }}-${{ github.run_id }}
-          restore-keys: |
-            apt-pkgs-${{ matrix.distro }}-${{ matrix.major }}-
-
-      - name: Customize Image (chroot)
+        env:
+          BASE_URL: ${{ matrix.base_url }}
+          SHA_FILE: ${{ matrix.sha_file }}
+          HASH_CMD: ${{ matrix.hash_cmd }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
         run: |
           set -euo pipefail
+          IMAGE_NAME="${{ matrix.image_name }}"
+          RELEASE_NAME="${{ matrix.distro }}-${{ matrix.major }}-pve-sunoaki+${RELEASE_TAG}.qcow2"
 
-          # Grow the virtual disk: stock cloud images ship tiny (2-3G) roots and
-          # apt installs for our package list run out of space (Ubuntu 22.04).
-          # root partitions sit last on the GPT, so growpart + resize2fs works.
-          sudo qemu-img resize "$IMAGE_NAME" +4G
-
-          # Attach the image as a block device. qemu-nbd reads qcow2 directly;
-          # fall back to losetup + raw conversion if the nbd module is missing.
-          sudo modprobe nbd max_part=8 2>/dev/null || true
-          ATTACHED_NBD=false
-          if sudo qemu-nbd -c /dev/nbd0 "$IMAGE_NAME"; then
-            ATTACHED_NBD=true
-            DISKDEV=/dev/nbd0
-          else
-            echo "qemu-nbd unavailable, falling back to losetup..."
-            sudo qemu-img convert -O raw "$IMAGE_NAME" /tmp/disk.raw
-            DISKDEV=$(sudo losetup --find --show --partscan /tmp/disk.raw)
-          fi
-          sudo partprobe "$DISKDEV" || true
-          sleep 2  # let udev settle so partition FSTYPE is populated
-          # Detect the real root partition by mounting each candidate and
-          # checking for /etc. Ubuntu >= 24.04 splits /boot onto its own
-          # partition (p16) and puts root on the last one; Debian and Ubuntu
-          # 22.04 keep everything on p1. blkid reads devices directly (no udev
-          # cache); lsblk is the fallback.
-          CANDIDATES=$(sudo blkid | awk -F: -v d="$DISKDEV" 'index($1,d)==1 && $0 ~ /TYPE="(ext4|xfs|btrfs)"/ {sub(/:/,"",$1); print $1}')
-          if [ -z "$CANDIDATES" ]; then
-            CANDIDATES=$(sudo lsblk -rno NAME,FSTYPE "$DISKDEV" | awk '$2=="ext4" {print "/dev/"$1}')
-          fi
-          ROOTDEV=""
-          BOOTDEV=""
-          sudo mkdir -p /tmp/probe
-          for dev in $CANDIDATES; do
-            if sudo mount "$dev" /tmp/probe >/dev/null 2>&1; then
-              if [ -d /tmp/probe/etc ] && [ -z "$ROOTDEV" ]; then
-                ROOTDEV="$dev"
-                echo "Root partition: $dev"
-              elif [ -d /tmp/probe/grub ] && [ -z "$BOOTDEV" ]; then
-                # A standalone /boot partition has grub/ at its top level,
-                # unlike a root partition where it lives under /boot/grub.
-                BOOTDEV="$dev"
-                echo "Boot partition: $dev"
-              fi
-              sudo umount /tmp/probe
-            fi
-          done
-          if [ -z "$ROOTDEV" ]; then
-            echo "Could not locate the root partition on $DISKDEV" >&2
-            sudo blkid | grep "$DISKDEV" || true
+          # Exact checksum lookup ($2 == file or "$2 == *file"), fail loudly
+          # instead of grepping with regex/substring surprises.
+          image_sha="$(wget -qO- "${BASE_URL}/${SHA_FILE}" | awk -v f="$IMAGE_NAME" '$2 == f || $2 == "*" f { print $1; exit }')"
+          [ -n "$image_sha" ] || {
+            echo "Checksum entry not found for ${IMAGE_NAME}" >&2
             exit 1
-          fi
+          }
 
-          # Grow the root filesystem to fill the space added by qemu-img resize.
-          ROOTNUM=$(echo "$ROOTDEV" | grep -oE '[0-9]+$')
-          sudo growpart "$DISKDEV" "$ROOTNUM" || true
-          sudo e2fsck -fy "$ROOTDEV" >/dev/null 2>&1 || true
-          sudo resize2fs "$ROOTDEV" >/dev/null 2>&1 || true
+          echo "Downloading image..."
+          wget "${BASE_URL}/${IMAGE_NAME}" -O "$IMAGE_NAME"
+          dl_sha="$(${HASH_CMD} "$IMAGE_NAME" | awk '{print $1}')"
+          [ "$dl_sha" = "$image_sha" ] || {
+            echo "Downloaded image checksum mismatch!" >&2
+            exit 1
+          }
+          echo "IMAGE_NAME=$IMAGE_NAME" >> "$GITHUB_ENV"
+          echo "RELEASE_NAME=$RELEASE_NAME" >> "$GITHUB_ENV"
 
-          sudo mkdir -p /mnt/img
-          sudo mount "$ROOTDEV" /mnt/img
-          if [ -n "$BOOTDEV" ]; then
-            sudo mount "$BOOTDEV" /mnt/img/boot
-          fi
+      # apt .deb cache keyed on the package list; a fixed key is shared across
+      # dates (no run_id) so rebuilds and same-day reruns actually hit it.
+      - name: Restore apt archive cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .apt-cache
+          key: apt-debs-${{ matrix.distro }}-${{ matrix.major }}-${{ hashFiles('config/cloud-image-packages.txt') }}
 
-          # Bind host runtime dirs so apt/dpkg/update-grub work inside the chroot.
-          sudo mount --bind /dev /mnt/img/dev
-          sudo mount --bind /dev/pts /mnt/img/dev/pts
-          sudo mount --bind /proc /mnt/img/proc
-          sudo mount --bind /sys /mnt/img/sys
-
-          # DNS inside the chroot; restore the original file afterwards.
-          sudo cp -a /mnt/img/etc/resolv.conf /tmp/resolv.conf.orig
-          sudo rm -f /mnt/img/etc/resolv.conf
-          echo "nameserver 1.1.1.1" | sudo tee /mnt/img/etc/resolv.conf > /dev/null
-
-          # Seed apt's download cache from a previous run (if any).
-          if [ -d .apt-cache ] && ls .apt-cache/*.deb >/dev/null 2>&1; then
-            sudo cp -n .apt-cache/*.deb /mnt/img/var/cache/apt/archives/ || true
-          fi
-
-          # Per-distro customization paths (see strategy matrix).
-          export SOURCES_FILE="${{ matrix.sources_file }}"
-          export CLOUD_CFG="${{ matrix.cloud_cfg }}"
-          export SOURCES_FORMAT="${{ matrix.sources_format }}"
-
-          sudo --preserve-env=SOURCES_FILE,CLOUD_CFG,SOURCES_FORMAT chroot /mnt/img /bin/bash -euxo pipefail <<'CHROOT_EOF'
-          export DEBIAN_FRONTEND=noninteractive
-          PACKAGES="qemu-guest-agent spice-vdagent aria2 net-tools iputils-ping iputils-arping iputils-tracepath mtr-tiny dnsutils sudo bash-completion unzip wget curl nano most screen less vim bzip2 lldpd htop zstd tmux"
-          # apt sources: drop deb-src lines (deb822 or legacy format)
-          if [ "$SOURCES_FORMAT" = "legacy" ]; then
-            sed -i 's|^deb-src|# deb-src|' "$SOURCES_FILE"
-          else
-            sed -i 's|Types: deb deb-src|Types: deb|g' "$SOURCES_FILE"
-          fi
-          # cloud-init: do not regenerate apt sources at boot (file may be absent on Ubuntu)
-          if [ -f "$CLOUD_CFG" ]; then
-            sed -i 's|generate_mirrorlists: true|generate_mirrorlists: false|g' "$CLOUD_CFG"
-          fi
-          apt-get update
-          apt-get -y upgrade
-          apt-get -y install $PACKAGES
-          apt-get -y autoremove --purge
-          # Timezone
-          ln -sf /usr/share/zoneinfo/Asia/Hong_Kong /etc/localtime
-          echo "Asia/Hong_Kong" > /etc/timezone
-          # GRUB: disable os-prober (loopback detection breaks booting)
-          if grep -q '^GRUB_DISABLE_OS_PROBER' /etc/default/grub; then
-            sed -i 's|^#\?GRUB_DISABLE_OS_PROBER=.*|GRUB_DISABLE_OS_PROBER=true|' /etc/default/grub
-          else
-            printf '# disables OS prober to avoid loopback detection which breaks booting\nGRUB_DISABLE_OS_PROBER=true\n' >> /etc/default/grub
-          fi
-          update-grub
-          # Serial console on ttyS1 (default PVE serial terminal)
-          ln -sf /lib/systemd/system/serial-getty@.service /etc/systemd/system/getty.target.wants/serial-getty@ttyS1.service
-          # NTP
-          printf '\nNTP=time.apple.com time.windows.com\n' >> /etc/systemd/timesyncd.conf
-          # Root login by password (PVE cloud-init defaults: root user + ssh password).
-          # Match any existing value (Ubuntu may write ssh_pwauth: 0 / disable_root: true)
-          sed -i 's|^disable_root:.*|disable_root: false|' /etc/cloud/cloud.cfg
-          grep -q '^disable_root:' /etc/cloud/cloud.cfg || echo 'disable_root: false' >> /etc/cloud/cloud.cfg
-          sed -i 's|^ssh_pwauth:.*|ssh_pwauth: true|' /etc/cloud/cloud.cfg
-          grep -q '^ssh_pwauth:' /etc/cloud/cloud.cfg || echo 'ssh_pwauth: true' >> /etc/cloud/cloud.cfg
-          printf 'PermitRootLogin yes\n' > /etc/ssh/sshd_config.d/99-pve-root-login.conf
-          # Root prompt (PVE default login is root). Single-quoted so \$ renders
-          # as '#' for root; printf avoids nested-heredoc indentation issues.
-          touch /root/.bashrc
-          sed -i '/^PS1=/d' /root/.bashrc
-          printf "PS1='%s'\n" '\[\033[01;31m\]\u\[\033[01;33m\]@\[\033[01;36m\]\h \[\033[01;33m\]\w \[\033[01;35m\]\$ \[\033[00m\]' >> /root/.bashrc
-          if [ ! -f /root/.profile ]; then
-            echo 'if [ -n "$BASH_VERSION" ]; then . ~/.bashrc; fi' > /root/.profile
-          elif ! grep -q 'bashrc' /root/.profile; then
-            echo 'if [ -n "$BASH_VERSION" ]; then . ~/.bashrc; fi' >> /root/.profile
-          fi
-          # BBR + TCP tuning
-          printf 'tcp_bbr\n' > /etc/modules-load.d/bbr.conf
-          printf 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\nnet.ipv4.tcp_slow_start_after_idle = 0\nnet.ipv4.tcp_fastopen = 3\n' > /etc/sysctl.d/99-network-tuning.conf
-          # Cleanup
-          rm -f /var/log/*.log
-          rm -rf /tmp/*
-          truncate -s 0 /etc/machine-id
-          CHROOT_EOF
-
-          # Export downloaded .debs for the cache, then scrub apt state from the image.
-          mkdir -p .apt-cache
-          sudo cp -n /mnt/img/var/cache/apt/archives/*.deb .apt-cache/ || true
-          sudo rm -rf /mnt/img/var/lib/apt/lists /mnt/img/var/cache/apt/archives /mnt/img/var/cache/apt/partial
-
-          # Restore resolv.conf and unmount in reverse order.
-          sudo cp -a /tmp/resolv.conf.orig /mnt/img/etc/resolv.conf
-          sudo umount /mnt/img/sys
-          sudo umount /mnt/img/proc
-          sudo umount /mnt/img/dev/pts
-          sudo umount /mnt/img/dev
-          if [ -n "$BOOTDEV" ]; then
-            sudo umount /mnt/img/boot
-          fi
-          sudo umount /mnt/img
-          if [ "$ATTACHED_NBD" = "true" ]; then
-            sudo qemu-nbd -d /dev/nbd0
-          else
-            sudo losetup -d "$DISKDEV"
-            rm -f /tmp/disk.raw
-          fi
+      # Host-side plumbing + chroot customization; see scripts/customize-image.sh.
+      - name: Customize Image (chroot)
+        env:
+          IMAGE_NAME: ${{ matrix.image_name }}
+          SOURCES_FILE: ${{ matrix.sources_file }}
+          CLOUD_CFG: ${{ matrix.cloud_cfg }}
+          SOURCES_FORMAT: ${{ matrix.sources_format }}
+        run: sudo -E bash scripts/customize-image.sh
 
       - name: Compress image
         run: |
           sudo qemu-img convert -O qcow2 -c "$IMAGE_NAME" "$RELEASE_NAME"
           rm -f "$IMAGE_NAME"
-          echo "IMAGE_NAME=$RELEASE_NAME" >> $GITHUB_ENV
+          echo "IMAGE_NAME=$RELEASE_NAME" >> "$GITHUB_ENV"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.distro }}-${{ matrix.major }}
           path: ${{ env.IMAGE_NAME }}
           if-no-files-found: error
+          # release is the long-lived artifact; keep the intermediate short
+          retention-days: 3
 
   release:
+    needs: [prepare, build]
+    if: ${{ needs.build.result == 'success' }}
     runs-on: ubuntu-24.04
-    needs: build
+    permissions:
+      contents: write
     steps:
       - name: Download built images
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: ./images
           merge-multiple: true
 
-      - name: Delete stale release for today
+      - name: Verify release contents
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
         run: |
           set -euo pipefail
-          TAG=$(date +%Y%m%d)
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Deleting previous release $TAG"
-            gh release delete "$TAG" --yes --cleanup-tag
-          else
-            # Remove a bare leftover tag (an earlier build may have been interrupted).
-            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" >/dev/null 2>&1 || true
-          fi
-          echo "RELEASE_TAG=$TAG" >> $GITHUB_ENV
+          expected=(
+            "debian-12-pve-sunoaki+${RELEASE_TAG}.qcow2"
+            "debian-13-pve-sunoaki+${RELEASE_TAG}.qcow2"
+            "ubuntu-22.04-pve-sunoaki+${RELEASE_TAG}.qcow2"
+            "ubuntu-24.04-pve-sunoaki+${RELEASE_TAG}.qcow2"
+            "ubuntu-26.04-pve-sunoaki+${RELEASE_TAG}.qcow2"
+          )
+          for image in "${expected[@]}"; do
+            test -s "images/$image" || {
+              echo "Missing or empty image: $image" >&2
+              exit 1
+            }
+          done
+          actual="$(find images -maxdepth 1 -type f -name '*.qcow2' | wc -l)"
+          test "$actual" -eq "${#expected[@]}" || {
+            echo "Unexpected qcow2 artifact count: $actual" >&2
+            exit 1
+          }
 
-      - name: Upload Images to Release
+      - name: Replace release for this date
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
         run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Deleting previous release $RELEASE_TAG"
+            gh release delete "$RELEASE_TAG" --yes --cleanup-tag
+          else
+            # Remove a bare leftover tag (an earlier build may have been interrupted).
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${RELEASE_TAG}" >/dev/null 2>&1 || true
+          fi
           # gh release create publishes immediately; softprops/action-gh-release
           # can leave the release stuck as an untagged draft (observed 2026-08-01).
           gh release create "$RELEASE_TAG" ./images/*.qcow2 \
             --title "PVE Cloud Images $RELEASE_TAG" \
             --notes "Proxmox VE cloud images for $RELEASE_TAG (debian-12/13, ubuntu-22.04/24.04/26.04)"
+
+  notify:
+    needs: [prepare, build, release]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Summarize results
+        run: |
+          printf '%s\n' \
+            "release_tag=${{ needs.prepare.outputs.release_tag }}" \
+            "build=${{ needs.build.result }}" \
+            "release=${{ needs.release.result }}"
+          # Future: hook Slack/Discord/issue notification here, one alert per
+          # run (not per matrix item) to avoid alert storms on platform failure.

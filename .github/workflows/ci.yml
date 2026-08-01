@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install linters
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck bats
+
+      - name: Validate workflow syntax
+        uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
+
+      - name: Validate shell syntax
+        run: bash -n scripts/*.sh
+
+      - name: ShellCheck
+        run: shellcheck --external-sources scripts/*.sh
+
+      - name: Rootfs tests
+        run: bats test
