@@ -73,7 +73,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-utils parted wget
+          sudo apt-get install -y qemu-utils parted cloud-guest-utils wget
 
       - name: Download Cloud Image with checksum
         run: |
@@ -105,6 +105,11 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Grow the virtual disk: stock cloud images ship tiny (2-3G) roots and
+          # apt installs for our package list run out of space (Ubuntu 22.04).
+          # root partitions sit last on the GPT, so growpart + resize2fs works.
+          sudo qemu-img resize "$IMAGE_NAME" +4G
+
           # Attach the image as a block device. qemu-nbd reads qcow2 directly;
           # fall back to losetup + raw conversion if the nbd module is missing.
           sudo modprobe nbd max_part=8 2>/dev/null || true
@@ -119,22 +124,49 @@ jobs:
           fi
           sudo partprobe "$DISKDEV" || true
           sleep 2  # let udev settle so partition FSTYPE is populated
-          # Detect the root partition dynamically: Ubuntu >= 24.04 puts root on
-          # p2 (p1 is the EFI System Partition), Debian/Ubuntu 22.04 keep it on p1.
-          # blkid reads devices directly (no udev cache); lsblk is the fallback.
-          ROOTDEV=$(sudo blkid | awk -F: -v d="$DISKDEV" 'index($1,d)==1 && $0 ~ /TYPE="(ext4|xfs|btrfs)"/ {sub(/:/,"",$1); print $1}' | head -1)
-          if [ -z "$ROOTDEV" ]; then
-            ROOTDEV=$(sudo lsblk -rno NAME,FSTYPE "$DISKDEV" | awk '$2=="ext4" {print "/dev/"$1}' | head -1)
+          # Detect the real root partition by mounting each candidate and
+          # checking for /etc. Ubuntu >= 24.04 splits /boot onto its own
+          # partition (p16) and puts root on the last one; Debian and Ubuntu
+          # 22.04 keep everything on p1. blkid reads devices directly (no udev
+          # cache); lsblk is the fallback.
+          CANDIDATES=$(sudo blkid | awk -F: -v d="$DISKDEV" 'index($1,d)==1 && $0 ~ /TYPE="(ext4|xfs|btrfs)"/ {sub(/:/,"",$1); print $1}')
+          if [ -z "$CANDIDATES" ]; then
+            CANDIDATES=$(sudo lsblk -rno NAME,FSTYPE "$DISKDEV" | awk '$2=="ext4" {print "/dev/"$1}')
           fi
+          ROOTDEV=""
+          BOOTDEV=""
+          sudo mkdir -p /tmp/probe
+          for dev in $CANDIDATES; do
+            if sudo mount "$dev" /tmp/probe >/dev/null 2>&1; then
+              if [ -d /tmp/probe/etc ] && [ -z "$ROOTDEV" ]; then
+                ROOTDEV="$dev"
+                echo "Root partition: $dev"
+              elif [ -d /tmp/probe/grub ] && [ -z "$BOOTDEV" ]; then
+                # A standalone /boot partition has grub/ at its top level,
+                # unlike a root partition where it lives under /boot/grub.
+                BOOTDEV="$dev"
+                echo "Boot partition: $dev"
+              fi
+              sudo umount /tmp/probe
+            fi
+          done
           if [ -z "$ROOTDEV" ]; then
             echo "Could not locate the root partition on $DISKDEV" >&2
             sudo blkid | grep "$DISKDEV" || true
             exit 1
           fi
-          echo "Root partition: $ROOTDEV"
+
+          # Grow the root filesystem to fill the space added by qemu-img resize.
+          ROOTNUM=$(echo "$ROOTDEV" | grep -oE '[0-9]+$')
+          sudo growpart "$DISKDEV" "$ROOTNUM" || true
+          sudo e2fsck -fy "$ROOTDEV" >/dev/null 2>&1 || true
+          sudo resize2fs "$ROOTDEV" >/dev/null 2>&1 || true
 
           sudo mkdir -p /mnt/img
           sudo mount "$ROOTDEV" /mnt/img
+          if [ -n "$BOOTDEV" ]; then
+            sudo mount "$BOOTDEV" /mnt/img/boot
+          fi
 
           # Bind host runtime dirs so apt/dpkg/update-grub work inside the chroot.
           sudo mount --bind /dev /mnt/img/dev
@@ -225,11 +257,14 @@ jobs:
           sudo umount /mnt/img/proc
           sudo umount /mnt/img/dev/pts
           sudo umount /mnt/img/dev
+          if [ -n "$BOOTDEV" ]; then
+            sudo umount /mnt/img/boot
+          fi
           sudo umount /mnt/img
           if [ "$ATTACHED_NBD" = "true" ]; then
             sudo qemu-nbd -d /dev/nbd0
           else
-            sudo losetup -d "$LOOPDEV"
+            sudo losetup -d "$DISKDEV"
             rm -f /tmp/disk.raw
           fi
 
