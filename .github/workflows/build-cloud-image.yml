@@ -11,16 +11,9 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        # 新增发行版只需在 include 里加一行，例如 Ubuntu:
-        # - distro: ubuntu
-        #   codename: noble
-        #   major: "24.04"
-        #   base_url: https://cloud-images.ubuntu.com/noble/current
-        #   image_name: noble-server-cloudimg-amd64.img
-        #   sha_file: SHA256SUMS
-        #   hash_cmd: sha256sum
-        #   sources_file: /etc/apt/sources.list.d/ubuntu.sources
-        #   cloud_cfg: /etc/cloud/cloud.cfg.d/99-fake_cloud.cfg
+        # 新增发行版只需在 include 里加一行。sources_format:
+        # deb822 = /etc/apt/sources.list.d/*.sources (Debian 12+ / Ubuntu 24.04+)
+        # legacy = /etc/apt/sources.list 单行 deb 格式 (Ubuntu 22.04)
         include:
           - distro: debian
             codename: trixie
@@ -31,6 +24,7 @@ jobs:
             hash_cmd: sha512sum
             sources_file: /etc/apt/sources.list.d/debian.sources
             cloud_cfg: /etc/cloud/cloud.cfg.d/01_debian_cloud.cfg
+            sources_format: deb822
           - distro: debian
             codename: bookworm
             major: "12"
@@ -40,6 +34,37 @@ jobs:
             hash_cmd: sha512sum
             sources_file: /etc/apt/sources.list.d/debian.sources
             cloud_cfg: /etc/cloud/cloud.cfg.d/01_debian_cloud.cfg
+            sources_format: deb822
+          - distro: ubuntu
+            codename: resolute
+            major: "26.04"
+            base_url: https://cloud-images.ubuntu.com/resolute/current
+            image_name: resolute-server-cloudimg-amd64.img
+            sha_file: SHA256SUMS
+            hash_cmd: sha256sum
+            sources_file: /etc/apt/sources.list.d/ubuntu.sources
+            cloud_cfg: /etc/cloud/cloud.cfg.d/99-fake_cloud.cfg
+            sources_format: deb822
+          - distro: ubuntu
+            codename: noble
+            major: "24.04"
+            base_url: https://cloud-images.ubuntu.com/noble/current
+            image_name: noble-server-cloudimg-amd64.img
+            sha_file: SHA256SUMS
+            hash_cmd: sha256sum
+            sources_file: /etc/apt/sources.list.d/ubuntu.sources
+            cloud_cfg: /etc/cloud/cloud.cfg.d/99-fake_cloud.cfg
+            sources_format: deb822
+          - distro: ubuntu
+            codename: jammy
+            major: "22.04"
+            base_url: https://cloud-images.ubuntu.com/jammy/current
+            image_name: jammy-server-cloudimg-amd64.img
+            sha_file: SHA256SUMS
+            hash_cmd: sha256sum
+            sources_file: /etc/apt/sources.list
+            cloud_cfg: /etc/cloud/cloud.cfg.d/99-fake_cloud.cfg
+            sources_format: legacy
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -86,15 +111,19 @@ jobs:
           if sudo qemu-nbd -c /dev/nbd0 "$IMAGE_NAME"; then
             ATTACHED_NBD=true
             DISKDEV=/dev/nbd0
-            ROOTDEV=/dev/nbd0p1
           else
             echo "qemu-nbd unavailable, falling back to losetup..."
             sudo qemu-img convert -O raw "$IMAGE_NAME" /tmp/disk.raw
-            LOOPDEV=$(sudo losetup --find --show --partscan /tmp/disk.raw)
-            DISKDEV=$LOOPDEV
-            ROOTDEV=${LOOPDEV}p1
+            DISKDEV=$(sudo losetup --find --show --partscan /tmp/disk.raw)
           fi
           sudo partprobe "$DISKDEV" || true
+          # Detect the root partition dynamically: Ubuntu >= 24.04 puts root on
+          # p2 (p1 is the EFI System Partition), Debian keeps it on p1.
+          ROOTDEV=$(sudo lsblk -rno NAME,FSTYPE "$DISKDEV" | awk '$2=="ext4" {print "/dev/"$1}' | head -1)
+          if [ -z "$ROOTDEV" ]; then
+            echo "Could not locate the root (ext4) partition on $DISKDEV" >&2
+            exit 1
+          fi
           echo "Root partition: $ROOTDEV"
 
           sudo mkdir -p /mnt/img
@@ -119,14 +148,21 @@ jobs:
           # Per-distro customization paths (see strategy matrix).
           export SOURCES_FILE="${{ matrix.sources_file }}"
           export CLOUD_CFG="${{ matrix.cloud_cfg }}"
+          export SOURCES_FORMAT="${{ matrix.sources_format }}"
 
-          sudo --preserve-env=SOURCES_FILE,CLOUD_CFG chroot /mnt/img /bin/bash -euxo pipefail <<'CHROOT_EOF'
+          sudo --preserve-env=SOURCES_FILE,CLOUD_CFG,SOURCES_FORMAT chroot /mnt/img /bin/bash -euxo pipefail <<'CHROOT_EOF'
           export DEBIAN_FRONTEND=noninteractive
           PACKAGES="qemu-guest-agent spice-vdagent aria2 net-tools iputils-ping iputils-arping iputils-tracepath mtr-tiny dnsutils sudo bash-completion unzip wget curl nano most screen less vim bzip2 lldpd htop zstd tmux"
-          # apt sources (DEB822): drop deb-src lines
-          sed -i 's|Types: deb deb-src|Types: deb|g' "$SOURCES_FILE"
-          # cloud-init: do not regenerate apt sources at boot
-          sed -i 's|generate_mirrorlists: true|generate_mirrorlists: false|g' "$CLOUD_CFG"
+          # apt sources: drop deb-src lines (deb822 or legacy format)
+          if [ "$SOURCES_FORMAT" = "legacy" ]; then
+            sed -i 's|^deb-src|# deb-src|' "$SOURCES_FILE"
+          else
+            sed -i 's|Types: deb deb-src|Types: deb|g' "$SOURCES_FILE"
+          fi
+          # cloud-init: do not regenerate apt sources at boot (file may be absent on Ubuntu)
+          if [ -f "$CLOUD_CFG" ]; then
+            sed -i 's|generate_mirrorlists: true|generate_mirrorlists: false|g' "$CLOUD_CFG"
+          fi
           apt-get update
           apt-get -y upgrade
           apt-get -y install $PACKAGES
@@ -145,15 +181,18 @@ jobs:
           ln -sf /lib/systemd/system/serial-getty@.service /etc/systemd/system/getty.target.wants/serial-getty@ttyS1.service
           # NTP
           printf '\nNTP=time.apple.com time.windows.com\n' >> /etc/systemd/timesyncd.conf
-          # Root login by password (PVE cloud-init defaults: root user + ssh password)
-          sed -i 's|disable_root: true|disable_root: false|g' /etc/cloud/cloud.cfg
+          # Root login by password (PVE cloud-init defaults: root user + ssh password).
+          # Match any existing value (Ubuntu may write ssh_pwauth: 0 / disable_root: true)
+          sed -i 's|^disable_root:.*|disable_root: false|' /etc/cloud/cloud.cfg
           grep -q '^disable_root:' /etc/cloud/cloud.cfg || echo 'disable_root: false' >> /etc/cloud/cloud.cfg
-          sed -i 's|ssh_pwauth: false|ssh_pwauth: true|g' /etc/cloud/cloud.cfg
+          sed -i 's|^ssh_pwauth:.*|ssh_pwauth: true|' /etc/cloud/cloud.cfg
           grep -q '^ssh_pwauth:' /etc/cloud/cloud.cfg || echo 'ssh_pwauth: true' >> /etc/cloud/cloud.cfg
           printf 'PermitRootLogin yes\n' > /etc/ssh/sshd_config.d/99-pve-root-login.conf
-          # Root prompt (PVE default login is root)
+          # Root prompt (PVE default login is root). Single-quoted so \$ renders
+          # as '#' for root; printf avoids nested-heredoc indentation issues.
           touch /root/.bashrc
-          echo 'PS1="\[\033[01;31m\]\u\[\033[01;33m\]@\[\033[01;36m\]\h \[\033[01;33m\]\w \[\033[01;35m\]\$ \[\033[00m\]"' >> /root/.bashrc
+          sed -i '/^PS1=/d' /root/.bashrc
+          printf "PS1='%s'\n" '\[\033[01;31m\]\u\[\033[01;33m\]@\[\033[01;36m\]\h \[\033[01;33m\]\w \[\033[01;35m\]\$ \[\033[00m\]' >> /root/.bashrc
           if [ ! -f /root/.profile ]; then
             echo 'if [ -n "$BASH_VERSION" ]; then . ~/.bashrc; fi' > /root/.profile
           elif ! grep -q 'bashrc' /root/.profile; then
