@@ -10,6 +10,7 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false  # 单个发行版失败不拖累其他构建
       matrix:
         # 新增发行版只需在 include 里加一行。sources_format:
         # deb822 = /etc/apt/sources.list.d/*.sources (Debian 12+ / Ubuntu 24.04+)
@@ -117,11 +118,17 @@ jobs:
             DISKDEV=$(sudo losetup --find --show --partscan /tmp/disk.raw)
           fi
           sudo partprobe "$DISKDEV" || true
+          sleep 2  # let udev settle so partition FSTYPE is populated
           # Detect the root partition dynamically: Ubuntu >= 24.04 puts root on
-          # p2 (p1 is the EFI System Partition), Debian keeps it on p1.
-          ROOTDEV=$(sudo lsblk -rno NAME,FSTYPE "$DISKDEV" | awk '$2=="ext4" {print "/dev/"$1}' | head -1)
+          # p2 (p1 is the EFI System Partition), Debian/Ubuntu 22.04 keep it on p1.
+          # blkid reads devices directly (no udev cache); lsblk is the fallback.
+          ROOTDEV=$(sudo blkid | awk -F: -v d="$DISKDEV" 'index($1,d)==1 && $0 ~ /TYPE="(ext4|xfs|btrfs)"/ {sub(/:/,"",$1); print $1}' | head -1)
           if [ -z "$ROOTDEV" ]; then
-            echo "Could not locate the root (ext4) partition on $DISKDEV" >&2
+            ROOTDEV=$(sudo lsblk -rno NAME,FSTYPE "$DISKDEV" | awk '$2=="ext4" {print "/dev/"$1}' | head -1)
+          fi
+          if [ -z "$ROOTDEV" ]; then
+            echo "Could not locate the root partition on $DISKDEV" >&2
+            sudo blkid | grep "$DISKDEV" || true
             exit 1
           fi
           echo "Root partition: $ROOTDEV"
