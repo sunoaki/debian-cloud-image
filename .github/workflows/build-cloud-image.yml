@@ -1,4 +1,4 @@
-name: Build Debian Cloud Image
+name: Build Cloud Images
 
 on:
   workflow_dispatch:
@@ -11,9 +11,35 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        version:
-          - stable
-          - oldstable
+        # 新增发行版只需在 include 里加一行，例如 Ubuntu:
+        # - distro: ubuntu
+        #   codename: noble
+        #   major: "24.04"
+        #   base_url: https://cloud-images.ubuntu.com/noble/current
+        #   image_name: noble-server-cloudimg-amd64.img
+        #   sha_file: SHA256SUMS
+        #   hash_cmd: sha256sum
+        #   sources_file: /etc/apt/sources.list.d/ubuntu.sources
+        #   cloud_cfg: /etc/cloud/cloud.cfg.d/99-fake_cloud.cfg
+        include:
+          - distro: debian
+            codename: trixie
+            major: "13"
+            base_url: https://cloud.debian.org/images/cloud/trixie/latest
+            image_name: debian-13-genericcloud-amd64.qcow2
+            sha_file: SHA512SUMS
+            hash_cmd: sha512sum
+            sources_file: /etc/apt/sources.list.d/debian.sources
+            cloud_cfg: /etc/cloud/cloud.cfg.d/01_debian_cloud.cfg
+          - distro: debian
+            codename: bookworm
+            major: "12"
+            base_url: https://cloud.debian.org/images/cloud/bookworm/latest
+            image_name: debian-12-genericcloud-amd64.qcow2
+            sha_file: SHA512SUMS
+            hash_cmd: sha512sum
+            sources_file: /etc/apt/sources.list.d/debian.sources
+            cloud_cfg: /etc/cloud/cloud.cfg.d/01_debian_cloud.cfg
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,48 +49,31 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-utils parted wget
 
-      - name: Download Debian Cloud Image with cache and sha512
+      - name: Download Cloud Image with checksum
         run: |
-          if [ "${{ matrix.version }}" = "stable" ]; then
-            IMAGE_URL="https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
-            IMAGE_NAME="debian-13-genericcloud-amd64.qcow2"
-            IMAGE_SHA512="$(wget -qO- https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS | grep "$IMAGE_NAME" | awk '{print $1}')"
-            BUILD_TIME=$(date +%Y%m%d%H%M)
-            RELEASE_NAME="debian-13-pve-sunoaki+${BUILD_TIME}.qcow2"
-          else
-            IMAGE_URL="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"
-            IMAGE_NAME="debian-12-genericcloud-amd64.qcow2"
-            IMAGE_SHA512="$(wget -qO- https://cloud.debian.org/images/cloud/bookworm/latest/SHA512SUMS | grep "$IMAGE_NAME" | awk '{print $1}')"
-            BUILD_TIME=$(date +%Y%m%d%H%M)
-            RELEASE_NAME="debian-12-pve-sunoaki+${BUILD_TIME}.qcow2"
-          fi
+          IMAGE_URL="${{ matrix.base_url }}/${{ matrix.image_name }}"
+          IMAGE_NAME="${{ matrix.image_name }}"
+          IMAGE_SHA="$(wget -qO- ${{ matrix.base_url }}/${{ matrix.sha_file }} | grep "$IMAGE_NAME" | awk '{print $1}')"
+          BUILD_DATE=$(date +%Y%m%d)
+          RELEASE_NAME="${{ matrix.distro }}-${{ matrix.major }}-pve-sunoaki+${BUILD_DATE}.qcow2"
 
-          USE_CACHE=false
-          if [ -f /tmp/$IMAGE_NAME ]; then
-            echo "Found cached image in /tmp/$IMAGE_NAME, checking sha512..."
-            CACHE_SHA512=$(sha512sum /tmp/$IMAGE_NAME | awk '{print $1}')
-            if [ "$CACHE_SHA512" = "$IMAGE_SHA512" ]; then
-              echo "Cache valid, using cached image."
-              cp /tmp/$IMAGE_NAME ./
-              USE_CACHE=true
-            else
-              echo "Cache invalid, will re-download."
-            fi
-          fi
-
-          if [ "$USE_CACHE" != "true" ]; then
-            echo "Downloading image..."
-            wget "$IMAGE_URL" -O "$IMAGE_NAME"
-            DL_SHA512=$(sha512sum "$IMAGE_NAME" | awk '{print $1}')
-            if [ "$DL_SHA512" != "$IMAGE_SHA512" ]; then
-              echo "Downloaded image sha512 mismatch!" >&2
-              exit 1
-            fi
-            cp "$IMAGE_NAME" /tmp/
+          echo "Downloading image..."
+          wget "$IMAGE_URL" -O "$IMAGE_NAME"
+          DL_SHA=$(${{ matrix.hash_cmd }} "$IMAGE_NAME" | awk '{print $1}')
+          if [ "$DL_SHA" != "$IMAGE_SHA" ]; then
+            echo "Downloaded image checksum mismatch!" >&2
+            exit 1
           fi
           echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_ENV
           echo "RELEASE_NAME=$RELEASE_NAME" >> $GITHUB_ENV
-          echo "RELEASE_TAG=${RELEASE_NAME%.qcow2}" >> $GITHUB_ENV
+
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: .apt-cache
+          key: apt-pkgs-${{ matrix.distro }}-${{ matrix.major }}-${{ github.run_id }}
+          restore-keys: |
+            apt-pkgs-${{ matrix.distro }}-${{ matrix.major }}-
 
       - name: Customize Image (chroot)
         run: |
@@ -102,18 +111,26 @@ jobs:
           sudo rm -f /mnt/img/etc/resolv.conf
           echo "nameserver 1.1.1.1" | sudo tee /mnt/img/etc/resolv.conf > /dev/null
 
-          sudo chroot /mnt/img /bin/bash -euxo pipefail <<'CHROOT_EOF'
+          # Seed apt's download cache from a previous run (if any).
+          if [ -d .apt-cache ] && ls .apt-cache/*.deb >/dev/null 2>&1; then
+            sudo cp -n .apt-cache/*.deb /mnt/img/var/cache/apt/archives/ || true
+          fi
+
+          # Per-distro customization paths (see strategy matrix).
+          export SOURCES_FILE="${{ matrix.sources_file }}"
+          export CLOUD_CFG="${{ matrix.cloud_cfg }}"
+
+          sudo --preserve-env=SOURCES_FILE,CLOUD_CFG chroot /mnt/img /bin/bash -euxo pipefail <<'CHROOT_EOF'
           export DEBIAN_FRONTEND=noninteractive
-          PACKAGES="qemu-guest-agent spice-vdagent aria2 net-tools iputils-ping iputils-arping iputils-tracepath mtr-tiny dnsutils sudo bash-completion unzip wget curl nano most screen less vim bzip2 lldpd htop zstd"
-          # DEB822 apt sources: drop deb-src lines
-          sed -i 's|Types: deb deb-src|Types: deb|g' /etc/apt/sources.list.d/debian.sources
+          PACKAGES="qemu-guest-agent spice-vdagent aria2 net-tools iputils-ping iputils-arping iputils-tracepath mtr-tiny dnsutils sudo bash-completion unzip wget curl nano most screen less vim bzip2 lldpd htop zstd tmux"
+          # apt sources (DEB822): drop deb-src lines
+          sed -i 's|Types: deb deb-src|Types: deb|g' "$SOURCES_FILE"
           # cloud-init: do not regenerate apt sources at boot
-          sed -i 's|generate_mirrorlists: true|generate_mirrorlists: false|g' /etc/cloud/cloud.cfg.d/01_debian_cloud.cfg
+          sed -i 's|generate_mirrorlists: true|generate_mirrorlists: false|g' "$CLOUD_CFG"
           apt-get update
           apt-get -y upgrade
           apt-get -y install $PACKAGES
           apt-get -y autoremove --purge
-          apt-get -y clean
           # Timezone
           ln -sf /usr/share/zoneinfo/Asia/Hong_Kong /etc/localtime
           echo "Asia/Hong_Kong" > /etc/timezone
@@ -128,13 +145,33 @@ jobs:
           ln -sf /lib/systemd/system/serial-getty@.service /etc/systemd/system/getty.target.wants/serial-getty@ttyS1.service
           # NTP
           printf '\nNTP=time.apple.com time.windows.com\n' >> /etc/systemd/timesyncd.conf
+          # Root login by password (PVE cloud-init defaults: root user + ssh password)
+          sed -i 's|disable_root: true|disable_root: false|g' /etc/cloud/cloud.cfg
+          grep -q '^disable_root:' /etc/cloud/cloud.cfg || echo 'disable_root: false' >> /etc/cloud/cloud.cfg
+          sed -i 's|ssh_pwauth: false|ssh_pwauth: true|g' /etc/cloud/cloud.cfg
+          grep -q '^ssh_pwauth:' /etc/cloud/cloud.cfg || echo 'ssh_pwauth: true' >> /etc/cloud/cloud.cfg
+          printf 'PermitRootLogin yes\n' > /etc/ssh/sshd_config.d/99-pve-root-login.conf
+          # Root prompt (PVE default login is root)
+          touch /root/.bashrc
+          echo 'PS1="\[\033[01;31m\]\u\[\033[01;33m\]@\[\033[01;36m\]\h \[\033[01;33m\]\w \[\033[01;35m\]\$ \[\033[00m\]"' >> /root/.bashrc
+          if [ ! -f /root/.profile ]; then
+            echo 'if [ -n "$BASH_VERSION" ]; then . ~/.bashrc; fi' > /root/.profile
+          elif ! grep -q 'bashrc' /root/.profile; then
+            echo 'if [ -n "$BASH_VERSION" ]; then . ~/.bashrc; fi' >> /root/.profile
+          fi
+          # BBR + TCP tuning
+          printf 'tcp_bbr\n' > /etc/modules-load.d/bbr.conf
+          printf 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\nnet.ipv4.tcp_slow_start_after_idle = 0\nnet.ipv4.tcp_fastopen = 3\n' > /etc/sysctl.d/99-network-tuning.conf
           # Cleanup
           rm -f /var/log/*.log
-          rm -rf /var/lib/apt/lists/*
-          rm -rf /var/cache/apt/*
           rm -rf /tmp/*
           truncate -s 0 /etc/machine-id
           CHROOT_EOF
+
+          # Export downloaded .debs for the cache, then scrub apt state from the image.
+          mkdir -p .apt-cache
+          sudo cp -n /mnt/img/var/cache/apt/archives/*.deb .apt-cache/ || true
+          sudo rm -rf /mnt/img/var/lib/apt/lists /mnt/img/var/cache/apt/archives /mnt/img/var/cache/apt/partial
 
           # Restore resolv.conf and unmount in reverse order.
           sudo cp -a /tmp/resolv.conf.orig /mnt/img/etc/resolv.conf
@@ -156,11 +193,43 @@ jobs:
           rm -f "$IMAGE_NAME"
           echo "IMAGE_NAME=$RELEASE_NAME" >> $GITHUB_ENV
 
-      - name: Upload Image to Release
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.distro }}-${{ matrix.major }}
+          path: ${{ env.IMAGE_NAME }}
+          if-no-files-found: error
+
+  release:
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - name: Download built images
+        uses: actions/download-artifact@v4
+        with:
+          path: ./images
+          merge-multiple: true
+
+      - name: Delete stale release for today
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG=$(date +%Y%m%d)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Deleting previous release $TAG"
+            gh release delete "$TAG" --yes --cleanup-tag
+          else
+            # Remove a bare leftover tag (an earlier build may have been interrupted).
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" >/dev/null 2>&1 || true
+          fi
+          echo "RELEASE_TAG=$TAG" >> $GITHUB_ENV
+
+      - name: Upload Images to Release
         uses: softprops/action-gh-release@v3
         with:
-          files: ${{ env.IMAGE_NAME }}
-          name: ${{ env.RELEASE_NAME }}
+          files: ./images/*.qcow2
+          name: "PVE Cloud Images ${{ env.RELEASE_TAG }}"
           tag_name: ${{ env.RELEASE_TAG }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
