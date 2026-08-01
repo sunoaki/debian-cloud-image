@@ -3,9 +3,12 @@ name: Build Debian Cloud Image
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
-    runs-on: self-hosted
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         version:
@@ -18,7 +21,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-utils libguestfs-tools wget
+          sudo apt-get install -y qemu-utils parted wget
 
       - name: Download Debian Cloud Image with cache and sha512
         run: |
@@ -27,13 +30,13 @@ jobs:
             IMAGE_NAME="debian-13-genericcloud-amd64.qcow2"
             IMAGE_SHA512="$(wget -qO- https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS | grep "$IMAGE_NAME" | awk '{print $1}')"
             BUILD_TIME=$(date +%Y%m%d%H%M)
-            RELEASE_NAME="debian-13-zstack-sunoaki+${BUILD_TIME}.qcow2"
+            RELEASE_NAME="debian-13-pve-sunoaki+${BUILD_TIME}.qcow2"
           else
             IMAGE_URL="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"
             IMAGE_NAME="debian-12-genericcloud-amd64.qcow2"
             IMAGE_SHA512="$(wget -qO- https://cloud.debian.org/images/cloud/bookworm/latest/SHA512SUMS | grep "$IMAGE_NAME" | awk '{print $1}')"
             BUILD_TIME=$(date +%Y%m%d%H%M)
-            RELEASE_NAME="debian-12-zstack-sunoaki+${BUILD_TIME}.qcow2"
+            RELEASE_NAME="debian-12-pve-sunoaki+${BUILD_TIME}.qcow2"
           fi
 
           USE_CACHE=false
@@ -42,7 +45,7 @@ jobs:
             CACHE_SHA512=$(sha512sum /tmp/$IMAGE_NAME | awk '{print $1}')
             if [ "$CACHE_SHA512" = "$IMAGE_SHA512" ]; then
               echo "Cache valid, using cached image."
-              sudo cp /tmp/$IMAGE_NAME ./
+              cp /tmp/$IMAGE_NAME ./
               USE_CACHE=true
             else
               echo "Cache invalid, will re-download."
@@ -57,51 +60,107 @@ jobs:
               echo "Downloaded image sha512 mismatch!" >&2
               exit 1
             fi
-            sudo cp "$IMAGE_NAME" /tmp/
+            cp "$IMAGE_NAME" /tmp/
           fi
           echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_ENV
           echo "RELEASE_NAME=$RELEASE_NAME" >> $GITHUB_ENV
+          echo "RELEASE_TAG=${RELEASE_NAME%.qcow2}" >> $GITHUB_ENV
 
-      - name: Upload zs-guest-tools
+      - name: Customize Image (chroot)
         run: |
-          sudo cp zs-guest-tools.tar.gz /tmp/zs-guest-tools.tar.gz
+          set -euo pipefail
 
-      - name: Prepare install script (normalize & inspect)
-        run: |
-          sed -i 's/\r$//' scripts/install-zs-guest-tools.sh || true
-          ls -l scripts/install-zs-guest-tools.sh || true
-          head -n 40 scripts/install-zs-guest-tools.sh || true
+          # Attach the image as a block device. qemu-nbd reads qcow2 directly;
+          # fall back to losetup + raw conversion if the nbd module is missing.
+          sudo modprobe nbd max_part=8 2>/dev/null || true
+          ATTACHED_NBD=false
+          if sudo qemu-nbd -c /dev/nbd0 "$IMAGE_NAME"; then
+            ATTACHED_NBD=true
+            DISKDEV=/dev/nbd0
+            ROOTDEV=/dev/nbd0p1
+          else
+            echo "qemu-nbd unavailable, falling back to losetup..."
+            sudo qemu-img convert -O raw "$IMAGE_NAME" /tmp/disk.raw
+            LOOPDEV=$(sudo losetup --find --show --partscan /tmp/disk.raw)
+            DISKDEV=$LOOPDEV
+            ROOTDEV=${LOOPDEV}p1
+          fi
+          sudo partprobe "$DISKDEV" || true
+          echo "Root partition: $ROOTDEV"
 
-      - name: Customize Image
+          sudo mkdir -p /mnt/img
+          sudo mount "$ROOTDEV" /mnt/img
+
+          # Bind host runtime dirs so apt/dpkg/update-grub work inside the chroot.
+          sudo mount --bind /dev /mnt/img/dev
+          sudo mount --bind /dev/pts /mnt/img/dev/pts
+          sudo mount --bind /proc /mnt/img/proc
+          sudo mount --bind /sys /mnt/img/sys
+
+          # DNS inside the chroot; restore the original file afterwards.
+          sudo cp -a /mnt/img/etc/resolv.conf /tmp/resolv.conf.orig
+          sudo rm -f /mnt/img/etc/resolv.conf
+          echo "nameserver 1.1.1.1" | sudo tee /mnt/img/etc/resolv.conf > /dev/null
+
+          sudo chroot /mnt/img /bin/bash -euxo pipefail <<'CHROOT_EOF'
+          export DEBIAN_FRONTEND=noninteractive
+          PACKAGES="qemu-guest-agent spice-vdagent aria2 net-tools iputils-ping iputils-arping iputils-tracepath mtr-tiny dnsutils sudo bash-completion unzip wget curl nano most screen less vim bzip2 lldpd htop zstd"
+          # DEB822 apt sources: drop deb-src lines
+          sed -i 's|Types: deb deb-src|Types: deb|g' /etc/apt/sources.list.d/debian.sources
+          # cloud-init: do not regenerate apt sources at boot
+          sed -i 's|generate_mirrorlists: true|generate_mirrorlists: false|g' /etc/cloud/cloud.cfg.d/01_debian_cloud.cfg
+          apt-get update
+          apt-get -y upgrade
+          apt-get -y install $PACKAGES
+          apt-get -y autoremove --purge
+          apt-get -y clean
+          # Timezone
+          ln -sf /usr/share/zoneinfo/Asia/Hong_Kong /etc/localtime
+          echo "Asia/Hong_Kong" > /etc/timezone
+          # GRUB: disable os-prober (loopback detection breaks booting)
+          if grep -q '^GRUB_DISABLE_OS_PROBER' /etc/default/grub; then
+            sed -i 's|^#\?GRUB_DISABLE_OS_PROBER=.*|GRUB_DISABLE_OS_PROBER=true|' /etc/default/grub
+          else
+            printf '# disables OS prober to avoid loopback detection which breaks booting\nGRUB_DISABLE_OS_PROBER=true\n' >> /etc/default/grub
+          fi
+          update-grub
+          # Serial console on ttyS1 (default PVE serial terminal)
+          ln -sf /lib/systemd/system/serial-getty@.service /etc/systemd/system/getty.target.wants/serial-getty@ttyS1.service
+          # NTP
+          printf '\nNTP=time.apple.com time.windows.com\n' >> /etc/systemd/timesyncd.conf
+          # Cleanup
+          rm -f /var/log/*.log
+          rm -rf /var/lib/apt/lists/*
+          rm -rf /var/cache/apt/*
+          rm -rf /tmp/*
+          truncate -s 0 /etc/machine-id
+          CHROOT_EOF
+
+          # Restore resolv.conf and unmount in reverse order.
+          sudo cp -a /tmp/resolv.conf.orig /mnt/img/etc/resolv.conf
+          sudo umount /mnt/img/sys
+          sudo umount /mnt/img/proc
+          sudo umount /mnt/img/dev/pts
+          sudo umount /mnt/img/dev
+          sudo umount /mnt/img
+          if [ "$ATTACHED_NBD" = "true" ]; then
+            sudo qemu-nbd -d /dev/nbd0
+          else
+            sudo losetup -d "$LOOPDEV"
+            rm -f /tmp/disk.raw
+          fi
+
+      - name: Compress image
         run: |
-          PACKAGES="qemu-guest-agent,spice-vdagent,aria2,net-tools,iputils-ping,iputils-arping,iputils-tracepath,mtr-tiny,dnsutils,sudo,bash-completion,unzip,wget,curl,nano,most,screen,less,vim,bzip2,lldpd,htop,zstd"
-            sudo virt-customize -a "$IMAGE_NAME" \
-            --smp 2 --verbose \
-            --timezone "Asia/Hong_Kong" \
-            --append-line "/etc/default/grub:# disables OS prober to avoid loopback detection which breaks booting" \
-            --append-line "/etc/default/grub:GRUB_DISABLE_OS_PROBER=true" \
-            --run-command "update-grub" \
-            --run-command "systemctl enable serial-getty@ttyS1.service" \
-            --mkdir /tmp/zs-guest-tools \
-            --upload /tmp/zs-guest-tools.tar.gz:/tmp/zs-guest-tools.tar.gz \
-            --run-command "tar -tzf /tmp/zs-guest-tools.tar.gz | head -n 20" \
-            --run-command "tar -xzf /tmp/zs-guest-tools.tar.gz -C /tmp/zs-guest-tools" \
-            --run-command "ls -l /tmp/zs-guest-tools || true" \
-            --run-command 'if [ -f /tmp/zs-guest-tools/install-zs-guest-tools.sh ]; then chmod +x /tmp/zs-guest-tools/install-zs-guest-tools.sh && /tmp/zs-guest-tools/install-zs-guest-tools.sh; else echo "install script not found in archive" >&2; fi' \
-            --update \
-            --install "$PACKAGES" \
-            --run-command "apt-get -y autoremove --purge && apt-get -y clean" \
-            --append-line "/etc/systemd/timesyncd.conf:NTP=time.apple.com time.windows.com" \
-            --delete "/var/log/*.log" \
-            --delete "/var/lib/apt/lists/*" \
-            --delete "/var/cache/apt/*" \
-            --delete "/tmp/*" \
-            --truncate "/etc/machine-id"
+          sudo qemu-img convert -O qcow2 -c "$IMAGE_NAME" "$RELEASE_NAME"
+          rm -f "$IMAGE_NAME"
+          echo "IMAGE_NAME=$RELEASE_NAME" >> $GITHUB_ENV
 
       - name: Upload Image to Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: ${{ env.IMAGE_NAME }}
           name: ${{ env.RELEASE_NAME }}
+          tag_name: ${{ env.RELEASE_TAG }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
