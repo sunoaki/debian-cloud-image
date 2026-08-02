@@ -34,6 +34,32 @@ configure_cloud_init() {
   sed -i 's|generate_mirrorlists: true|generate_mirrorlists: false|g' "$cfg"
 }
 
+# PVE cloud-init applies cipassword to the *default* user, so root must be
+# the default user (Ubuntu ships "ubuntu" with root locked) and unlocked,
+# otherwise root password login never works. Also preserve apt sources: PVE
+# swaps in the xtom HK mirror after download, and without this Ubuntu
+# cloud-init regenerates sources.list(.d) on first boot, clobbering it.
+configure_cloud_cfg() {
+  local cloud_cfg
+  cloud_cfg="$(root_path /etc/cloud/cloud.cfg)"
+  if [ ! -f "$cloud_cfg" ]; then
+    echo "WARN: /etc/cloud/cloud.cfg missing, skipping cloud.cfg tweaks" >&2
+    return 0
+  fi
+  sed -i 's|^disable_root:.*|disable_root: false|' "$cloud_cfg"
+  grep -q '^disable_root:' "$cloud_cfg" || echo 'disable_root: false' >> "$cloud_cfg"
+  sed -i 's|^ssh_pwauth:.*|ssh_pwauth: true|' "$cloud_cfg"
+  grep -q '^ssh_pwauth:' "$cloud_cfg" || echo 'ssh_pwauth: true' >> "$cloud_cfg"
+
+  if grep -q '^[[:space:]]*name: ubuntu' "$cloud_cfg"; then
+    sed -i 's|^\([[:space:]]*\)name: ubuntu$|\1name: root|' "$cloud_cfg"
+    sed -i 's|^\([[:space:]]*\)lock_passwd: True$|\1lock_passwd: False|' "$cloud_cfg"
+  fi
+
+  mkdir -p "$(root_path /etc/cloud/cloud.cfg.d)"
+  printf 'apt_preserve_sources_list: true\n' > "$(root_path /etc/cloud/cloud.cfg.d/99-pve-apt.cfg)"
+}
+
 install_packages() {
   local packages
   packages="$(grep -Ev '^\s*(#|$)' "$PACKAGES_FILE" | xargs)"
@@ -73,28 +99,8 @@ configure_system() {
   # NTP
   printf '\nNTP=time.apple.com time.windows.com\n' >> "$(root_path /etc/systemd/timesyncd.conf)"
 
-  # Root login by password (PVE cloud-init defaults: root user + ssh password).
-  local cloud_cfg
-  cloud_cfg="$(root_path /etc/cloud/cloud.cfg)"
-  sed -i 's|^disable_root:.*|disable_root: false|' "$cloud_cfg"
-  grep -q '^disable_root:' "$cloud_cfg" || echo 'disable_root: false' >> "$cloud_cfg"
-  sed -i 's|^ssh_pwauth:.*|ssh_pwauth: true|' "$cloud_cfg"
-  grep -q '^ssh_pwauth:' "$cloud_cfg" || echo 'ssh_pwauth: true' >> "$cloud_cfg"
-
+  configure_cloud_cfg
   printf 'PermitRootLogin yes\n' > "$(root_path /etc/ssh/sshd_config.d/99-pve-root-login.conf)"
-
-  # Root prompt (PVE default login is root). Single-quoted so \$ renders
-  # as '#' for root; printf avoids nested-heredoc indentation issues.
-  touch "$(root_path /root/.bashrc)"
-  sed -i '/^PS1=/d' "$(root_path /root/.bashrc)"
-  printf "PS1='%s'\n" '\[\033[01;31m\]\u\[\033[01;33m\]@\[\033[01;36m\]\h \[\033[01;33m\]\w \[\033[01;35m\]\$ \[\033[00m\]' >> "$(root_path /root/.bashrc)"
-  if [ ! -f "$(root_path /root/.profile)" ]; then
-    # shellcheck disable=SC2016 # $BASH_VERSION must stay literal in .profile
-    echo 'if [ -n "$BASH_VERSION" ]; then . ~/.bashrc; fi' > "$(root_path /root/.profile)"
-  elif ! grep -q 'bashrc' "$(root_path /root/.profile)"; then
-    # shellcheck disable=SC2016 # $BASH_VERSION must stay literal in .profile
-    echo 'if [ -n "$BASH_VERSION" ]; then . ~/.bashrc; fi' >> "$(root_path /root/.profile)"
-  fi
 
   # BBR + kernel tuning. sysctl values live in the repo as a template file
   # (config/cloud-image-sysctl.conf) so they are easy to review and edit.

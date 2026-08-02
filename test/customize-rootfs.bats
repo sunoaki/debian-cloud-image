@@ -46,3 +46,31 @@ setup() {
 @test "missing cloud-init config is a no-op" {
   configure_cloud_init
 }
+
+@test "ubuntu default user becomes root and is unlocked" {
+  mkdir -p "$ROOT/etc/cloud"
+  printf 'disable_root: false\nsystem_info:\n  default_user:\n    name: ubuntu\n    lock_passwd: True\n    gecos: Ubuntu\n' \
+    > "$ROOT/etc/cloud/cloud.cfg"
+
+  configure_cloud_cfg
+
+  grep -q '^disable_root: false' "$ROOT/etc/cloud/cloud.cfg"
+  grep -q 'name: root' "$ROOT/etc/cloud/cloud.cfg"
+  ! grep -q 'name: ubuntu' "$ROOT/etc/cloud/cloud.cfg"
+  grep -q 'lock_passwd: False' "$ROOT/etc/cloud/cloud.cfg"
+}
+
+@test "debian cloud.cfg keeps its default user" {
+  mkdir -p "$ROOT/etc/cloud"
+  printf 'disable_root: false\nsystem_info:\n  default_user:\n    name: debian\n    lock_passwd: True\n' \
+    > "$ROOT/etc/cloud/cloud.cfg"
+
+  configure_cloud_cfg
+
+  grep -q 'name: debian' "$ROOT/etc/cloud/cloud.cfg"
+  grep -q 'apt_preserve_sources_list: true' "$ROOT/etc/cloud/cloud.cfg.d/99-pve-apt.cfg"
+}
+
+@test "missing /etc/cloud/cloud.cfg is a no-op" {
+  configure_cloud_cfg
+}
