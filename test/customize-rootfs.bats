@@ -74,3 +74,28 @@ setup() {
 @test "missing /etc/cloud/cloud.cfg is a no-op" {
   configure_cloud_cfg
 }
+
+@test "first-login security notice is installed for pam_motd" {
+  mkdir -p "$ROOT/etc/ssh/sshd_config.d" "$ROOT/etc/default" \
+    "$ROOT/etc/systemd/system/getty.target.wants" "$ROOT/etc/modules-load.d" "$ROOT/etc/sysctl.d"
+  : > "$ROOT/etc/default/grub"
+  export SYSCTL_FILE="$BATS_TEST_DIRNAME/fixtures/sysctl.conf"
+
+  configure_system
+
+  # pam_motd reads /etc/motd.d/, and this directory overrides /run/motd.d and
+  # /usr/lib/motd.d, so a file here reaches SSH and console logins alike.
+  [ -f "$ROOT/etc/motd.d/99-pve-security" ]
+  grep -q 'prohibit-password' "$ROOT/etc/motd.d/99-pve-security"
+}
+
+@test "password root login is enabled in sshd" {
+  mkdir -p "$ROOT/etc/ssh/sshd_config.d" "$ROOT/etc/default" \
+    "$ROOT/etc/systemd/system/getty.target.wants" "$ROOT/etc/modules-load.d" "$ROOT/etc/sysctl.d"
+  : > "$ROOT/etc/default/grub"
+  export SYSCTL_FILE="$BATS_TEST_DIRNAME/fixtures/sysctl.conf"
+
+  configure_system
+
+  grep -q '^PermitRootLogin yes$' "$ROOT/etc/ssh/sshd_config.d/99-pve-root-login.conf"
+}

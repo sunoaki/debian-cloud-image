@@ -1,1 +1,4 @@
 .sisyphus/
+.apt-cache/
+*.qcow2
+sha*.sum

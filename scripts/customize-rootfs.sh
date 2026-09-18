@@ -36,9 +36,13 @@ configure_cloud_init() {
 
 # PVE cloud-init applies cipassword to the *default* user, so root must be
 # the default user (Ubuntu ships "ubuntu" with root locked) and unlocked,
-# otherwise root password login never works. Also preserve apt sources: PVE
-# swaps in the xtom HK mirror after download, and without this Ubuntu
-# cloud-init regenerates sources.list(.d) on first boot, clobbering it.
+# otherwise root password login never works.
+#
+# Two different files are in play and they are not interchangeable:
+#   $CLOUD_CFG (from config/images.yaml) - the per-distro vendor drop-in,
+#     e.g. .../01_debian_cloud.cfg or .../99-fake_cloud.cfg, handled above.
+#   /etc/cloud/cloud.cfg - the main config holding system_info.default_user;
+#     it has no matrix entry because it is at the same path on every distro.
 configure_cloud_cfg() {
   local cloud_cfg
   cloud_cfg="$(root_path /etc/cloud/cloud.cfg)"
@@ -56,6 +60,11 @@ configure_cloud_cfg() {
     sed -i 's|^\([[:space:]]*\)lock_passwd: True$|\1lock_passwd: False|' "$cloud_cfg"
   fi
 
+  # Keep the apt sources that PVE swaps in after download: without this Ubuntu
+  # cloud-init regenerates sources.list(.d) on first boot and clobbers the
+  # xtom HK mirror. The top-level apt_preserve_sources_list name is converted by
+  # cloud-init (cc_apt_configure: convert_to_v3_apt_format) into
+  # apt.preserve_sources_list, so this spelling is the supported one.
   mkdir -p "$(root_path /etc/cloud/cloud.cfg.d)"
   printf 'apt_preserve_sources_list: true\n' > "$(root_path /etc/cloud/cloud.cfg.d/99-pve-apt.cfg)"
 }
@@ -101,6 +110,20 @@ configure_system() {
 
   configure_cloud_cfg
   printf 'PermitRootLogin yes\n' > "$(root_path /etc/ssh/sshd_config.d/99-pve-root-login.conf)"
+
+  # First-login warning for password-based root login. pam_motd shows the files
+  # in /etc/motd.d/ (and that directory overrides /run/motd.d and
+  # /usr/lib/motd.d), so this reaches both SSH and console logins.
+  mkdir -p "$(root_path /etc/motd.d)"
+  cat > "$(root_path /etc/motd.d/99-pve-security)" <<'MOTD'
+This image ships with password-based root SSH login enabled and its images are
+published publicly. Keep this host on a controlled network (private subnet or a
+security group restricted by source IP), and switch to key-based authentication
+before exposing it. To disable password login:
+
+    printf 'PermitRootLogin prohibit-password\n' > /etc/ssh/sshd_config.d/99-pve-root-login.conf
+    systemctl reload ssh
+MOTD
 
   # BBR + kernel tuning. sysctl values live in the repo as a template file
   # (config/cloud-image-sysctl.conf) so they are easy to review and edit.
