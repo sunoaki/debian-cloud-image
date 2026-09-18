@@ -113,7 +113,12 @@ configure_system() {
   # GRUB: disable os-prober (loopback detection breaks booting)
   local grub_cfg
   grub_cfg="$(root_path /etc/default/grub)"
-  if grep -q '^GRUB_DISABLE_OS_PROBER' "$grub_cfg"; then
+  if [ ! -f "$grub_cfg" ]; then
+    # Not fatal: the file is Debian's convention. RHEL family keeps its defaults
+    # in /etc/default/grub too, so this only triggers on an unusual derivative,
+    # and os-prober is not installed there in the first place.
+    echo "WARN: $grub_cfg absent, skipping the os-prober tweak" >&2
+  elif grep -q '^GRUB_DISABLE_OS_PROBER' "$grub_cfg"; then
     sed -i 's|^#\?GRUB_DISABLE_OS_PROBER=.*|GRUB_DISABLE_OS_PROBER=true|' "$grub_cfg"
   else
     printf '# disables OS prober to avoid loopback detection which breaks booting\nGRUB_DISABLE_OS_PROBER=true\n' >> "$grub_cfg"
@@ -124,7 +129,10 @@ configure_system() {
     family_update_bootloader
   fi
 
-  # Serial console on ttyS1 (default PVE serial terminal)
+  # Serial console on ttyS1 (default PVE serial terminal). Create the wants
+  # directory first: RHEL-family images do not necessarily ship it, and without
+  # it the symlink fails and the template never gets a serial console.
+  mkdir -p "$(root_path /etc/systemd/system/getty.target.wants)"
   ln -sf /lib/systemd/system/serial-getty@.service \
     "$(root_path /etc/systemd/system/getty.target.wants/serial-getty@ttyS1.service)"
 
@@ -166,8 +174,12 @@ MOTD
   # BBR and no fq, so the RHEL file omits those keys rather than carrying
   # settings that silently do nothing.
   if [ "$FAMILY" = "debian" ]; then
+    mkdir -p "$(root_path /etc/modules-load.d)"
     printf 'tcp_bbr\n' > "$(root_path /etc/modules-load.d/bbr.conf)"
   fi
+  # Create the target directory rather than trusting the image to have it; the
+  # serial-getty symlink below has the same requirement.
+  mkdir -p "$(root_path /etc/sysctl.d)" "$(root_path /etc/systemd/system/getty.target.wants)"
   install -m 0644 "$SYSCTL_FILE" "$(root_path /etc/sysctl.d/99-pve-cloud-tuning.conf)"
 }
 

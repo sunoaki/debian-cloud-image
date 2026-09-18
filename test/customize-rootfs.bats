@@ -308,3 +308,36 @@ rhel_setup() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"no SELinux file_contexts"* ]]
 }
+
+# --- robustness: directories the image may not ship -------------------------
+
+# An `install` into a directory that does not exist aborts the build, and the
+# RHEL family does not necessarily ship every /etc subdirectory the Debian family
+# does. Creating each target directory makes the write independent of the image.
+@test "sysctl and module dirs are created before writing into them" {
+  mkdir -p "$ROOT/etc/cloud" "$ROOT/etc/ssh"
+  printf 'disable_root: true\n' > "$ROOT/etc/cloud/cloud.cfg"
+  printf 'Include /etc/ssh/sshd_config.d/*.conf\n' > "$ROOT/etc/ssh/sshd_config"
+  # deliberately do NOT pre-create /etc/sysctl.d, /etc/modules-load.d or the
+  # getty wants dir
+  export SYSCTL_FILE="$BATS_TEST_DIRNAME/fixtures/sysctl.conf"
+
+  run configure_system
+
+  [ "$status" -eq 0 ]
+  [ -f "$ROOT/etc/sysctl.d/99-pve-cloud-tuning.conf" ]
+  [ -f "$ROOT/etc/modules-load.d/bbr.conf" ]
+  [ -L "$ROOT/etc/systemd/system/getty.target.wants/serial-getty@ttyS1.service" ]
+}
+
+@test "a missing /etc/default/grub is a warning, not a failure" {
+  mkdir -p "$ROOT/etc/cloud" "$ROOT/etc/ssh" "$ROOT/etc/sysctl.d"
+  printf 'disable_root: true\n' > "$ROOT/etc/cloud/cloud.cfg"
+  printf 'Include /etc/ssh/sshd_config.d/*.conf\n' > "$ROOT/etc/ssh/sshd_config"
+  export SYSCTL_FILE="$BATS_TEST_DIRNAME/fixtures/sysctl.conf"
+
+  run configure_system
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"skipping the os-prober tweak"* ]]
+}
