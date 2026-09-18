@@ -77,11 +77,19 @@ configure_cloud_cfg() {
   sed -i 's|^ssh_pwauth:.*|ssh_pwauth: true|' "$cloud_cfg"
   grep -q '^ssh_pwauth:' "$cloud_cfg" || echo 'ssh_pwauth: true' >> "$cloud_cfg"
 
-  alias="$(family_default_user_alias)"
-  if [ -n "$alias" ] && grep -q "^[[:space:]]*name: ${alias}$" "$cloud_cfg"; then
-    sed -i "s|^\([[:space:]]*\)name: ${alias}\$|\1name: root|" "$cloud_cfg"
-    sed -i 's|^\([[:space:]]*\)lock_passwd: [Tt]rue$|\1lock_passwd: False|' "$cloud_cfg"
-  fi
+  # The family may name several candidates (rhel prints both rocky and centos);
+  # rename whichever the image actually has, and unlock it. lock_passwd is only
+  # touched when the rename happened, so an unrelated True elsewhere is not
+  # rewritten by accident.
+  while read -r alias; do
+    [ -n "$alias" ] || continue
+    if grep -q "^[[:space:]]*name: ${alias}$" "$cloud_cfg"; then
+      echo "Renaming cloud-init default user '${alias}' to root"
+      sed -i "s|^\([[:space:]]*\)name: ${alias}\$|\1name: root|" "$cloud_cfg"
+      sed -i 's|^\([[:space:]]*\)lock_passwd: [Tt]rue$|\1lock_passwd: False|' "$cloud_cfg"
+      break
+    fi
+  done < <(family_default_user_alias)
 
   # Keep the apt sources that PVE swaps in after download: without this Ubuntu
   # cloud-init regenerates sources.list(.d) on first boot and clobbers the
@@ -136,14 +144,16 @@ configure_system() {
   # /etc/motd.d/ and that directory overrides /run/motd.d and /usr/lib/motd.d, so
   # the drop-in reaches SSH and console logins where motd.d is supported.
   mkdir -p "$(root_path /etc/motd.d)"
-  cat > "$(root_path /etc/motd.d/99-pve-security)" <<'MOTD'
+  # The unit is ssh on Debian and sshd on RHEL, so name it from the family hook
+  # rather than hardcoding one; the operator pastes this command verbatim.
+  cat > "$(root_path /etc/motd.d/99-pve-security)" <<MOTD
 This image ships with password-based root SSH login enabled and its images are
 published publicly. Keep this host on a controlled network (private subnet or a
 security group restricted by source IP), and switch to key-based authentication
 before exposing it. To disable password login:
 
     printf 'PermitRootLogin prohibit-password\n' > /etc/ssh/sshd_config.d/99-pve-root-login.conf
-    systemctl reload ssh
+    systemctl reload $(family_ssh_unit)
 MOTD
   # CentOS 7's pam_motd has no motd.d support, so mirror the notice into /etc/motd
   # as well; on the other families /etc/motd is the lower-priority file and the

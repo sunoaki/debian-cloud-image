@@ -1,0 +1,28 @@
+# Packages installed into every RHEL-family PVE cloud image (one per line,
+# # comments allowed). Kept separate from the Debian list rather than mapped from
+# it: the names genuinely differ (dnsutils/bind-utils, vim/vim-enhanced, and
+# iputils-ping/-arping/-tracepath all collapse into a single iputils on RHEL), so
+# a translation table would be a second place to get it wrong.
+#
+# Deliberately smaller than the Debian list. Omitting aria2, most, screen and
+# htop: they are not in BaseOS or AppStream, and pulling in EPEL to get them
+# would add a third-party repo and its GPG trust chain to an image that is
+# published publicly.
+qemu-guest-agent
+spice-vdagent
+net-tools
+iputils
+mtr
+bind-utils
+sudo
+bash-completion
+unzip
+wget
+curl
+nano
+less
+vim-enhanced
+bzip2
+zstd
+tmux
+lldpd
