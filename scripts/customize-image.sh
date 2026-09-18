@@ -331,7 +331,12 @@ if [ "${FAMILY:-debian}" = "debian" ]; then
   rm -rf "$MNT/var/lib/apt/lists" "$MNT/var/cache/apt/archives" "$MNT/var/cache/apt/partial"
 fi
 
-# Restore resolv.conf; cleanup() handles umounts + detach on exit.
-cp -a "$RESOLV_BACKUP" "$MNT/etc/resolv.conf"
+# Restore resolv.conf when there was a real file to preserve; cleanup() handles
+# umounts + detach on exit. A symlink original leaves RESOLV_BACKUP empty, so
+# guard the same way cleanup() does: `cp -a ""` would abort the build at the very
+# last step, after the chroot work had already succeeded.
+if [ -n "$RESOLV_BACKUP" ] && [ -f "$RESOLV_BACKUP" ]; then
+  cp -a "$RESOLV_BACKUP" "$MNT/etc/resolv.conf"
+fi
 RESOLV_BACKUP=
 echo "customize-image.sh done"
