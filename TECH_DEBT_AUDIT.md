@@ -237,3 +237,77 @@ guest 自身的内核计时为 15.6s（BIOS）与 17.7s（UEFI），与墙钟 15
 - **未 push**（按决定留在本地）。
 - 软性档**未实测**：需要 GitHub runner 上的 5 个发行版镜像，我无法在本地执行（需 root + nbd 模块 + 完整镜像）。**因此「TCG 下启动到 login prompt」这条路径目前只有语法与逻辑验证，没有端到端证据。** 首次开启 `BOOT_TEST=true` 构建时请留意其输出。
 - 硬性档的 `sync_boot_to_root` / `assert_boot_chain` 走的是**模拟假根目录**验证，未在真实镜像上跑过——真实镜像需要 root 与 nbd。分区可见性断言用的是本机真实磁盘（5/5 通过）与模拟截断（按预期拒绝）。
+
+---
+
+## 真实构建验证结果（2026-09-18，run 35311571104）
+
+push 后触发了一次 `workflow_dispatch`（按决定不开 `BOOT_TEST`）。**这次构建同时给出了 C1 的确证与我自己代码的一个严重误报。**
+
+### C1 修复得到确证
+
+noble（24.04）的构建日志：
+
+```
+Root partition: /dev/nbd0p1
+Boot partition: /dev/nbd0p16          <-- 关键证据
+Boot chain before customization: 1 kernel(s), 1 initrd(s)
+Boot chain: 1 kernel(s) and 1 initrd(s) under /boot
+```
+
+`/dev/nbd0p16` 出现在日志里，这**只可能**发生在 `max_part` 不再限制槽位之后：`max_part=8` 时内核只暴露 15 个槽位，p16 根本不会作为设备节点存在，`blkid` 也不会列出它。debian-13 的日志同样显示 `Root partition: /dev/nbd0p1`、`Boot chain ... 1 kernel(s)`，以及 GRUB 自身输出 `Found linux image: /boot/vmlinuz-6.12.107+deb13-cloud-amd64`。
+
+### 我的断言误报（已修）
+
+同一轮构建中 **debian-13 与 debian-12 失败**，jammy 也失败，原因是我新加的 `sync_boot_to_root`：
+
+```
+Found linux image: /boot/vmlinuz-6.12.107+deb13-cloud-amd64
+Bootloader present at /mnt/img/boot/grub but /boot is not a separate partition;
+the chroot wrote its kernel to the root filesystem instead.
+##[error]Process completed with exit code 1.
+```
+
+这条判断是**错的**：Debian 云镜像本来就没有独立 `/boot` 分区，`/boot/grub` 只是 root 分区里的普通目录，而 GRUB 刚刚成功找到了内核。该检查把「存在引导器目录」等同于「漏挂了一个独立 /boot 分区」——对 Ubuntu ≥ 24.04 成立，对矩阵里其余所有镜像都不成立。
+
+**为什么我本地没发现**：我用模拟挂载点测了五个分支，但那些模拟是我自己构造的「有引导器且 /boot 非独立挂载点」场景，我以为那就是 C1 的签名；实际 C1 的签名是「有一个分区没被挂载、但它装着内核或引导器」，与「引导器在 root 分区的 /boot/grub 下」是两回事。**只有真实构建能暴露这个差别。**
+
+**修法**：删除该断言。真正的首要检测器其实是先前加的槽位守卫——隐藏的 /boot 会让 `partx` 与内核节点数不一致（16 vs 15 触发，16 vs 16 通过，两个方向都已实测），它在任何挂载之前就会失败。保留的是更窄的不变式：若检测到并挂载了独立 `/boot`，它之后必须装着内核；外加原有的「数量未减少」与「不为 0」。
+
+### 第二个真实缺陷：`lsblk PARTTYPE` 在 runner 上读不到（已修）
+
+三个发行版的日志都有：
+
+```
+WARN: could not read partition type GUIDs; boot test will fall back to BIOS
+```
+
+`lsblk -rno PARTTYPE` 在 nbd 设备上没输出（它依赖 udev 数据），于是固件探测恒定退回 BIOS——而 Ubuntu ≥ 24.04 需要 UEFI，这会让软性档用错固件启动并产生假失败。已改用 `partx --show --noheadings -o NR,TYPE`，它与槽位守卫用的是同一数据源（直接读盘上的分区表），本机实测两种布局都判对：有 ESP 判 `efi`，无 ESP 判 `bios`。
+
+### 修复后重跑：全部通过并已发布（run 35312738669）
+
+| Job | 结果 |
+|---|---|
+| generate-matrix / prepare | ✓ |
+| build debian-12 / debian-13 / ubuntu-22.04 / 24.04 / 26.04 | ✓ 全部通过 |
+| release | ✓ 发布 `20260918`，5 个 qcow2 齐备 |
+| notify | ✓ |
+
+发布产物（`gh release view`，非校验步骤的自报）：`debian-12` 510 MB、`debian-13` 518 MB、`ubuntu-22.04` 969 MB、`ubuntu-24.04` 828 MB、`ubuntu-26.04` 1538 MB。
+
+**C1 的最终确证**——noble（24.04）构建日志：
+
+```
+Root partition: /dev/nbd0p1
+Boot partition: /dev/nbd0p16
+Boot chain before customization: 1 kernel(s), 1 initrd(s), separate /boot: true
+Boot chain: 1 kernel(s) and 1 initrd(s) under /boot
+```
+
+`separate /boot: true` 与 `Boot partition: /dev/nbd0p16` 只有在 `max_part` 不再限制槽位时才可能出现。debian-12 与 debian-13 则显示 `separate /boot: false` 并正常通过——即误报已消除，两种布局都走通。
+
+**固件探测也确认修好**：debian-13 报 `Firmware for boot test: efi (from 3 partition type GUIDs)`、noble 报 `from 4 partition type GUIDs`。上一轮的 `WARN: could not read partition type GUIDs` 已消失，说明改用 `partx` 生效（Debian 12/13 确实带 ESP，因此判 `efi` 是对的）。
+
+### 这一轮暴露的方法论问题
+
+我先前那版硬性档断言在本地「五个分支全测过」却仍然放行了一个会在真实构建里失败的判断。原因是**我测的是我自己构造的场景**，而那个场景（引导器在 `/boot/grub` 且 `/boot` 非独立挂载点）被我错当成了 C1 的签名；真实的判据是「有分区未被挂载但装着内核」。本地模拟无法证伪一个关于真实镜像布局的假设，只有真实构建能。后续任何触及镜像布局的断言，都应当先在真实构建里跑一轮再视为可用。
