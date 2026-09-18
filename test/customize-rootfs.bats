@@ -68,7 +68,20 @@ setup() {
   configure_cloud_cfg
 
   grep -q 'name: debian' "$ROOT/etc/cloud/cloud.cfg"
-  grep -q 'apt_preserve_sources_list: true' "$ROOT/etc/cloud/cloud.cfg.d/99-pve-apt.cfg"
+}
+
+# The nested form, not the deprecated top-level apt_preserve_sources_list which
+# logs a warning on every boot and is scheduled for removal in cloud-init 27.1.
+@test "apt preserve_sources_list uses the non-deprecated nested form" {
+  mkdir -p "$ROOT/etc/cloud"
+  printf 'disable_root: false\n' > "$ROOT/etc/cloud/cloud.cfg"
+
+  configure_cloud_cfg
+
+  local cfg="$ROOT/etc/cloud/cloud.cfg.d/99-pve-apt.cfg"
+  grep -q '^apt:$' "$cfg"
+  grep -q '^  preserve_sources_list: true$' "$cfg"
+  ! grep -q 'apt_preserve_sources_list' "$cfg"
 }
 
 @test "missing /etc/cloud/cloud.cfg is a no-op" {
