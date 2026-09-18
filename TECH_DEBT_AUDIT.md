@@ -221,7 +221,12 @@ guest 自身的内核计时为 15.6s（BIOS）与 17.7s（UEFI），与墙钟 15
 3. **qemu 启动后不会自行退出**（停在 login 提示等待输入），原先 `timeout 900 qemu ...` 会让每个发行版白等满 900 秒。已改为后台启动 + 轮询日志 + 命中即 `kill`。
 4. **`sfdisk` 无法解析 qcow2**（它读的是容器本身，报「不包含可识别的分区表」），原先靠在 workflow 里探测分区类型来选固件会恒定判为 BIOS。已改为在 `customize-image.sh` 里趁磁盘挂在 nbd 上时用 `lsblk -rno PARTTYPE` 记录，写入 `/tmp/firmware.txt` 供后续步骤读取。
 
-另外确认了一件之前不确定的事：`-serial file:` **可写**（早先担心的 EACCES 存在，实测无此问题；79920 字节日志正常写入）。
+另外确认了一件之前不确定的事：`-serial file:` **可写**（早先担心的 EACCES 不存在；79920 字节日志正常写入）。
+
+### 2c. Round 3 的两项调整
+
+- **固件选择改走 `$GITHUB_ENV`**：原先用 `/tmp/firmware.txt` 在步骤间传值，与仓库约定不符（`SRC_IMAGE`、`RELEASE_NAME` 都走 `GITHUB_ENV`）。现改为 `customize-image.sh` 把 `FIRMWARE=efi|bios` 写入 `$GITHUB_ENV`，并对 `GITHUB_ENV` 未设置时（本地手动运行）做保护，不报错。实测三种情形：设置了 `GITHUB_ENV` 时正确写入；未设置时静默跳过；`FIRMWARE` 为空时不写文件。
+- **不加「`/boot` 内核版本集合 == dpkg 已装内核」比对**（决定）。因此硬性档仍只断言「内核/initrd 数量未减少且不为 0」。**已知残留缺口**：若新装内核与旧内核版本号相同（重装同版本），数量不变，该断言不会发现 `/boot` 内容错位。这是经权衡后接受的取舍，不是遗忘。
 
 ### 3. `IMAGE_NAME` 解耦
 
