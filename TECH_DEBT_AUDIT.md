@@ -311,3 +311,47 @@ Boot chain: 1 kernel(s) and 1 initrd(s) under /boot
 ### 这一轮暴露的方法论问题
 
 我先前那版硬性档断言在本地「五个分支全测过」却仍然放行了一个会在真实构建里失败的判断。原因是**我测的是我自己构造的场景**，而那个场景（引导器在 `/boot/grub` 且 `/boot` 非独立挂载点）被我错当成了 C1 的签名；真实的判据是「有分区未被挂载但装着内核」。本地模拟无法证伪一个关于真实镜像布局的假设，只有真实构建能。后续任何触及镜像布局的断言，都应当先在真实构建里跑一轮再视为可用。
+
+---
+
+## 审计自身的错误更正（2026-09-18）
+
+grilling 过程中重查证据，发现**我在本报告与 README 里写下了错误结论**。逐条更正，因为审计报告本身的可信度取决于这些更正被记录下来。
+
+### 更正 1：README 中「Ubuntu ≥ 24.04 的 `/boot` 在 p16」是错的
+
+我在修复 H5 时写下了这句。真实证据（run `35312738669` 的构建日志）：
+
+| 发行版 | 独立 `/boot` | 分区号 |
+|---|---|---|
+| debian-13 | 无（`separate /boot: false`） | `/boot` 是 root 分区上的目录 |
+| debian-12 | 无 | 同上 |
+| ubuntu-22.04 | 无 | 同上 |
+| ubuntu-24.04 | 有 | **p16** |
+| ubuntu-26.04 | 有 | **p13** |
+
+「≥ 24.04」把 26.04 也包含了，而 26.04 的 `/boot` 在 p13。**我在修一个文档漂移的过程中制造了一个新的文档漂移。** README 已改为按发行版逐个陈述，并说明编号随发行版变化、脚本不依赖它。这条更正也说明：写死分区号本身就不该出现在文档里。
+
+### 更正 2：首次构建的失败清单写错了
+
+我在上一节写「noble 与 resolute 在压缩之后的某步失败」。`gh run view --json jobs` 的实际结论是：
+
+| Job | run 1 结论 |
+|---|---|
+| prepare / generate-matrix / notify | success |
+| build debian-13 | **failure** |
+| build debian-12 | **failure** |
+| build ubuntu-22.04 | **failure** |
+| build ubuntu-24.04 | **success** |
+| build ubuntu-26.04 | **success** |
+| release | skipped |
+
+即失败的正是三个**没有**独立 `/boot` 的发行版（与我那个误报断言的逻辑完全一致），而 noble 与 resolute **成功**。我先前凭印象写下了失败清单，没有核对，属于未经验证的陈述。
+
+### 更正 3：`apt_preserve_sources_list` 一项，你早先的判断是对的
+
+首版报告把它列为「待验证的有效性疑问」（M12）。原始依据只是 cloud-init 的上游配置模板 `config/cloud.cfg.tmpl` 不含该键——但该模板描述的是**默认值**，不是**接受的键名**。核对实现 `cloudinit/config/cc_apt_configure.py` 后确认：`handle()` 第 105 行调用 `convert_to_v3_apt_format`，经 `convert_v2_to_v3_apt_format` 把顶层 `apt_preserve_sources_list` 映射为 `apt.preserve_sources_list`（映射表在第 821 行），且该模块无 `cfg_path`、读全局命名空间。**由「模板里没有」推断「键无效」是错误推理**；使用者的判断先于我的核实成立。
+
+### 本轮更正的影响范围
+
+上述三项都只影响文档与报告文字，不影响任何已通过构建的代码。README 的改动已在本地修正并通过门禁（`bash -n`、shellcheck、bats 9/9）。

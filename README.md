@@ -71,4 +71,4 @@ qm template 9000
 | Ubuntu | 26.04 (resolute) / 24.04 (noble) | cloud-images.ubuntu.com | DEB822 (`ubuntu.sources`) |
 | Ubuntu | 22.04 (jammy)                    | cloud-images.ubuntu.com | legacy (`sources.list`)   |
 
-新增发行版只需在 `config/images.yaml` 里加一条记录（并在 PVE 侧 `update-cloud-templates.sh` 里加一个模板 VMID），产物会自动变为 `<distro>-<major>-pve-sunoaki+YYYYMMDD.qcow2` 并合并进同一个 Release。注意 `sources_format` 字段：22.04 用 `legacy`，其余用 `deb822`。root 分区由脚本按内容探测（挂载候选分区后找 `/etc`），不依赖分区编号：Debian 12/13 与 Ubuntu 22.04 的 root 在 p1；Ubuntu ≥ 24.04 的 root 同样在 p1，另有独立的 `/boot` 在 p16、EFI 在 p15。
+新增发行版只需在 `config/images.yaml` 里加一条记录（并在 PVE 侧 `update-cloud-templates.sh` 里加一个模板 VMID），产物会自动变为 `<distro>-<major>-pve-sunoaki+YYYYMMDD.qcow2` 并合并进同一个 Release。注意 `sources_format` 字段：22.04 用 `legacy`，其余用 `deb822`。root 分区由脚本按内容探测（挂载候选分区后找 `/etc`），不依赖分区编号：五个发行版的 root 都在 p1。只有 Ubuntu 24.04 与 26.04 另有独立的 `/boot` 分区（分别在 p16 与 p13，编号随发行版变化，脚本不依赖它），Debian 12/13 与 Ubuntu 22.04 的 `/boot` 就是 root 分区上的目录。
