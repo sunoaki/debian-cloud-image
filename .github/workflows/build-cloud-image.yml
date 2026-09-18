@@ -183,12 +183,12 @@ jobs:
           accel=tcg
           [ -r /dev/kvm ] && accel=kvm
 
-          # Firmware is chosen from the partition type GUIDs recorded by
-          # scripts/customize-image.sh while the disk was attached, because a
-          # qcow2 cannot be probed directly -- sfdisk reads the container and
-          # reports no partition table. Booting with the wrong firmware fails
-          # for reasons unrelated to the image being broken.
-          if [ "$(cat /tmp/firmware.txt 2>/dev/null || echo bios)" = "efi" ]; then
+          # Firmware is chosen from the partition type GUIDs that
+          # scripts/customize-image.sh read while the disk was attached, because
+          # a qcow2 cannot be probed directly -- sfdisk reads the container and
+          # reports no partition table. Booting with the wrong firmware fails for
+          # reasons unrelated to the image being broken.
+          if [ "${FIRMWARE:-bios}" = "efi" ]; then
             firmware=uefi
             fw_args=(-drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd
                      -drive if=pflash,format=raw,file=/usr/share/OVMF/OVMF_VARS_4M.fd)

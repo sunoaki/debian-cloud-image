@@ -127,18 +127,22 @@ fi
 # Record the partition type GUIDs now that the disk is attached: the advisory
 # boot test in the workflow needs them to choose BIOS or UEFI firmware, and a
 # qcow2 cannot be probed directly (sfdisk reads the container, not the table).
-# /tmp is on the same runner for the rest of the job.
+FIRMWARE=
 lsblk -rno PARTTYPE "$DISKDEV" 2>/dev/null | grep -v '^$' > /tmp/parttypes.txt || true
 if [ -s /tmp/parttypes.txt ]; then
   if grep -qi '^c12a7328-f81f-11d2-ba4b-00a0c93ec93b$' /tmp/parttypes.txt; then
-    echo "efi" > /tmp/firmware.txt
+    FIRMWARE=efi
   else
-    echo "bios" > /tmp/firmware.txt
+    FIRMWARE=bios
   fi
-  echo "Firmware for boot test: $(cat /tmp/firmware.txt) (from $(wc -l < /tmp/parttypes.txt) partition type GUIDs)"
+  echo "Firmware for boot test: $FIRMWARE (from $(wc -l < /tmp/parttypes.txt) partition type GUIDs)"
 else
-  rm -f /tmp/firmware.txt
   echo "WARN: could not read partition type GUIDs; boot test will fall back to BIOS" >&2
+fi
+# Hand the value to later workflow steps through $GITHUB_ENV (the file only
+# exists under GitHub Actions; a local run simply skips this).
+if [ -n "$FIRMWARE" ] && [ -n "${GITHUB_ENV:-}" ]; then
+  echo "FIRMWARE=$FIRMWARE" >> "$GITHUB_ENV"
 fi
 
 # Detect the real root partition by mounting each candidate and checking for
