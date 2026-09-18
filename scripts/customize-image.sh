@@ -257,9 +257,12 @@ fi
 rm -f "$MNT/etc/resolv.conf"
 echo "nameserver 1.1.1.1" > "$MNT/etc/resolv.conf"
 
-# Seed apt's download cache from a previous run (if any).
-if [ -d "$REPO_ROOT/.apt-cache" ] && ls "$REPO_ROOT/.apt-cache"/*.deb >/dev/null 2>&1; then
-  cp -n "$REPO_ROOT/.apt-cache"/*.deb "$MNT/var/cache/apt/archives/" || true
+# Seed apt's download cache from a previous run (if any). Debian family only:
+# the RHEL family has no apt archives directory to seed.
+if [ "${FAMILY:-debian}" = "debian" ] &&
+  compgen -G "$REPO_ROOT/.apt-cache/*.deb" >/dev/null; then
+  mkdir -p "$MNT/var/cache/apt/archives"
+  cp -n "$REPO_ROOT/.apt-cache/"*.deb "$MNT/var/cache/apt/archives/" || true
 fi
 
 # Stage the rootfs customization script, package list and sysctl template
@@ -317,9 +320,16 @@ assert_boot_chain() {
 assert_boot_chain
 
 # Export downloaded .debs for the cache, then scrub apt state from the image.
-mkdir -p "$REPO_ROOT/.apt-cache"
-cp -n "$MNT/var/cache/apt/archives/"*.deb "$REPO_ROOT/.apt-cache/" || true
-rm -rf "$MNT/var/lib/apt/lists" "$MNT/var/cache/apt/archives" "$MNT/var/cache/apt/partial"
+# apt-specific, so only for the debian family: an unmatched *.deb glob aborts
+# under `set -e` even with `|| true`, which is how a Rocky build died here after
+# its whole chroot stage had already succeeded.
+if [ "${FAMILY:-debian}" = "debian" ]; then
+  mkdir -p "$REPO_ROOT/.apt-cache"
+  if compgen -G "$MNT/var/cache/apt/archives/*.deb" >/dev/null; then
+    cp -n "$MNT/var/cache/apt/archives/"*.deb "$REPO_ROOT/.apt-cache/" || true
+  fi
+  rm -rf "$MNT/var/lib/apt/lists" "$MNT/var/cache/apt/archives" "$MNT/var/cache/apt/partial"
+fi
 
 # Restore resolv.conf; cleanup() handles umounts + detach on exit.
 cp -a "$RESOLV_BACKUP" "$MNT/etc/resolv.conf"
