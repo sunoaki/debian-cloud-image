@@ -228,9 +228,17 @@ jobs:
       # (GitHub documents nested VMs as unsupported), so this falls back to TCG
       # and, because TCG is ~10-50x slower, it is advisory: a failure here is
       # reported but does not fail the build. The hard content assertions live in
-      # scripts/customize-image.sh. Enable with a repo variable BOOT_TEST=true.
+      # scripts/customize-image.sh.
+      #
+      # On by default for the rhel family, off for debian. The RHEL family is
+      # where a wrong result is hardest to catch by reading files: SELinux labels,
+      # grub2 and the separate XBOOTLDR /boot can all fail at boot while every
+      # file-based assertion passes. Debian/Ubuntu have shipped through this path
+      # for longer, and their builds are the common case for the schedule, so they
+      # stay opt-in to avoid adding minutes to every run. BOOT_TEST=true forces it
+      # on everywhere; BOOT_TEST=false forces it off.
       - name: Boot test (advisory, TCG)
-        if: ${{ vars.BOOT_TEST == 'true' }}
+        if: ${{ (matrix.family == 'rhel' && vars.BOOT_TEST != 'false') || vars.BOOT_TEST == 'true' }}
         continue-on-error: true
         env:
           IMAGE: ${{ env.IMAGE_NAME }}
