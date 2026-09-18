@@ -11,7 +11,12 @@ setup() {
   export SOURCES_FILE="/etc/apt/sources.list.d/debian.sources"
   export SOURCES_FORMAT="deb822"
   export CLOUD_CFG="/etc/cloud/cloud.cfg.d/01_debian_cloud.cfg"
+  export FAMILY="debian"
+  export FAMILY_DIR="$BATS_TEST_DIRNAME/../scripts/family"
   source "$BATS_TEST_DIRNAME/../scripts/customize-rootfs.sh"
+  # main() loads the family file in production; tests call individual functions,
+  # so load it here the same way.
+  load_family
 }
 
 @test "deb822 source drops deb-src types" {
@@ -111,4 +116,64 @@ setup() {
   configure_system
 
   grep -q '^PermitRootLogin yes$' "$ROOT/etc/ssh/sshd_config.d/99-pve-root-login.conf"
+}
+
+# --- family dispatch --------------------------------------------------------
+
+@test "the debian family is loaded and provides every hook main() calls" {
+  for hook in family_install_packages family_configure_sources family_update_bootloader \
+    family_ssh_unit family_configure_ntp family_relabel family_default_user_alias; do
+    [ "$(type -t "$hook")" = "function" ] || {
+      echo "missing hook: $hook"
+      return 1
+    }
+  done
+}
+
+@test "an unknown family fails loudly instead of silently skipping steps" {
+  FAMILY=nosuchfamily run load_family
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"no family implementation for 'nosuchfamily'"* ]]
+}
+
+# The rename target is per family; getting it wrong means PVE's cipassword lands
+# on a user nobody logs in as, which fails only at login time on a real guest.
+@test "debian renames the ubuntu default user" {
+  [ "$(family_default_user_alias)" = "ubuntu" ]
+}
+
+@test "debian does not write an apt drop-in for non-debian families" {
+  mkdir -p "$ROOT/etc/cloud"
+  printf 'disable_root: true\n' > "$ROOT/etc/cloud/cloud.cfg"
+  FAMILY=rhel
+
+  configure_cloud_cfg
+
+  [ ! -f "$ROOT/etc/cloud/cloud.cfg.d/99-pve-apt.cfg" ]
+}
+
+# CentOS 7 ships no Include line, so without this the PermitRootLogin drop-in is
+# inert and root password login silently never works.
+@test "sshd_config gains an Include for the drop-in directory when absent" {
+  mkdir -p "$ROOT/etc/ssh/sshd_config.d" "$ROOT/etc/default" \
+    "$ROOT/etc/systemd/system/getty.target.wants" "$ROOT/etc/modules-load.d" "$ROOT/etc/sysctl.d"
+  : > "$ROOT/etc/default/grub"
+  printf 'PasswordAuthentication yes\n' > "$ROOT/etc/ssh/sshd_config"
+  export SYSCTL_FILE="$BATS_TEST_DIRNAME/fixtures/sysctl.conf"
+
+  configure_system
+
+  grep -q '^Include /etc/ssh/sshd_config.d/\*\.conf$' "$ROOT/etc/ssh/sshd_config"
+}
+
+@test "an existing Include line is not duplicated" {
+  mkdir -p "$ROOT/etc/ssh/sshd_config.d" "$ROOT/etc/default" \
+    "$ROOT/etc/systemd/system/getty.target.wants" "$ROOT/etc/modules-load.d" "$ROOT/etc/sysctl.d"
+  : > "$ROOT/etc/default/grub"
+  printf 'Include /etc/ssh/sshd_config.d/*.conf\n' > "$ROOT/etc/ssh/sshd_config"
+  export SYSCTL_FILE="$BATS_TEST_DIRNAME/fixtures/sysctl.conf"
+
+  configure_system
+
+  [ "$(grep -c '^Include /etc/ssh/sshd_config.d' "$ROOT/etc/ssh/sshd_config")" -eq 1 ]
 }

@@ -172,16 +172,31 @@ if [ -z "$ROOTDEV" ]; then
   exit 1
 fi
 
-# Grow the root filesystem to fill the space added by qemu-img resize. growpart
-# and e2fsck legitimately return non-zero (partition already maximal; errors
-# found and fixed), so only resize2fs is allowed to fail the build: if it does
-# not grow, the chroot apt run below dies with ENOSPC far from the real cause.
-# The resulting free space is asserted *after* the mount below: running df on an
-# unmounted device reports the host's /dev tmpfs, not the partition.
+# Grow the root filesystem to fill the space added by qemu-img resize. The
+# recipe depends on the filesystem, and so does *when* it runs:
+#   ext4 (Debian/Ubuntu) - resize2fs acts on the device and must run unmounted.
+#   xfs  (Rocky/CentOS)  - xfs_growfs acts through the mountpoint and the
+#                          filesystem must be mounted (man 8 xfs_growfs).
+# growpart always runs first because it edits the partition table either way, and
+# it legitimately returns non-zero when the partition is already maximal.
 ROOTNUM=$(echo "$ROOTDEV" | grep -oE '[0-9]+$')
 growpart "$DISKDEV" "$ROOTNUM" || true
-e2fsck -fy "$ROOTDEV" >/dev/null 2>&1 || true
-resize2fs "$ROOTDEV"
+
+ROOT_FS=$(blkid -o value -s TYPE "$ROOTDEV" 2>/dev/null || true)
+GROW_RECIPE=$(layout_grow_recipe "$ROOT_FS")
+[ -n "$GROW_RECIPE" ] || {
+  echo "No growth recipe for root filesystem '${ROOT_FS:-unknown}' on $ROOTDEV;" >&2
+  echo "the package install would run out of space." >&2
+  exit 1
+}
+echo "Root filesystem: ${ROOT_FS} (grows ${GROW_RECIPE})"
+
+if [ "$GROW_RECIPE" = "offline" ]; then
+  # e2fsck returns non-zero for "errors found and fixed", so only resize2fs is
+  # allowed to fail the build here.
+  e2fsck -fy "$ROOTDEV" >/dev/null 2>&1 || true
+  resize2fs "$ROOTDEV"
+fi
 
 mkdir -p "$MNT"
 mount "$ROOTDEV" "$MNT"
@@ -189,11 +204,17 @@ if [ -n "$BOOTDEV" ]; then
   mount "$BOOTDEV" "$MNT/boot"
 fi
 
+if [ "$GROW_RECIPE" = "mounted" ]; then
+  case "$ROOT_FS" in
+  xfs) xfs_growfs "$MNT" >/dev/null ;;
+  esac
+fi
+
 # Fail here rather than inside the chroot if the resize above did not take: the
 # package install then dies with ENOSPC, which points nowhere near the cause.
 AVAIL_KB=$(df -Pk "$MNT" | awk 'NR==2 {print $4}')
 [ "$AVAIL_KB" -ge 1048576 ] || {
-  echo "Only ${AVAIL_KB}KiB free on $MNT after resize2fs; the package install needs more." >&2
+  echo "Only ${AVAIL_KB}KiB free on $MNT after growing ${ROOT_FS}; the package install needs more." >&2
   exit 1
 }
 
@@ -226,14 +247,19 @@ fi
 install -m 0755 "$SCRIPT_DIR/customize-rootfs.sh" "$MNT/tmp/customize-rootfs.sh"
 install -m 0644 "$PACKAGES_FILE" "$MNT/tmp/cloud-image-packages.txt"
 install -m 0644 "$SYSCTL_FILE" "$MNT/tmp/cloud-image-sysctl.conf"
+# The family hooks are sourced inside the chroot, so they travel with the script.
+install -d "$MNT/tmp/family"
+install -m 0644 "$SCRIPT_DIR/family/"*.sh "$MNT/tmp/family/"
 
-chroot "$MNT" /usr/bin/env \
-  SOURCES_FILE="$SOURCES_FILE" \
-  CLOUD_CFG="$CLOUD_CFG" \
-  SOURCES_FORMAT="$SOURCES_FORMAT" \
-  PACKAGES_FILE=/tmp/cloud-image-packages.txt \
-  SYSCTL_FILE=/tmp/cloud-image-sysctl.conf \
-  /bin/bash /tmp/customize-rootfs.sh
+# FAMILY and FAMILY_DIR are exported as plain env vars rather than passed through
+# `env VAR=...`: CentOS 7 ships coreutils 8.22, and while its `env` handles the
+# plain form fine, exporting keeps the construct readable and side-steps the
+# question entirely.
+export SOURCES_FILE CLOUD_CFG SOURCES_FORMAT FAMILY
+export PACKAGES_FILE=/tmp/cloud-image-packages.txt
+export SYSCTL_FILE=/tmp/cloud-image-sysctl.conf
+export FAMILY_DIR=/tmp/family
+chroot "$MNT" /bin/bash /tmp/customize-rootfs.sh
 
 # Hard verification tier: confirm the boot chain is where the firmware will look.
 # The failure this guards against is the one observed in production: a partition

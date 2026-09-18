@@ -43,6 +43,14 @@ jobs:
           # added (the whole point of the yaml-driven matrix).
           ruby -ryaml -rjson -e '
             images = YAML.load_file("config/images.yaml")["images"]
+            # frozen entries only build on a manual dispatch: their upstream
+            # content can no longer change, so a scheduled rebuild would produce
+            # the same image and a redundant release tag.
+            if ENV["GITHUB_EVENT_NAME"] != "workflow_dispatch"
+              frozen = images.count { |i| i["frozen"] }
+              images = images.reject { |i| i["frozen"] }
+              warn "skipping #{frozen} frozen entr(ies) on a scheduled run" if frozen > 0
+            end
             File.open(ENV["GITHUB_OUTPUT"], "a") do |f|
               f.puts "matrix=#{JSON.generate(images)}"
               f.puts "names=#{JSON.generate(images.map { |i| "#{i["distro"]}-#{i["major"]}" })}"
@@ -97,6 +105,8 @@ jobs:
         run: |
           set -euo pipefail
           IMAGE_NAME="${{ matrix.image_name }}"
+          # shellcheck source=scripts/partition-layout.sh
+          . scripts/partition-layout.sh
           fetch_retry() {
             local url="$1" out="$2" attempt=1
             until wget --tries=3 --retry-connrefused --waitretry=2 -O "$out" "$url" 2>&1; do
@@ -109,10 +119,12 @@ jobs:
               attempt=$((attempt + 1))
             done
           }
-          fetch_retry "${BASE_URL}/${SHA_FILE}" "sha512.sum"
-          image_sha="$(awk -v f="$IMAGE_NAME" '$2 == f || $2 == "*" f { print $1; exit }' sha512.sum)"
+          fetch_retry "${BASE_URL}/${SHA_FILE}" sums.txt
+          # layout_checksum_for handles the GNU, GNU-binary-marker and BSD
+          # checksum shapes across distros; the previous awk matched only GNU.
+          image_sha="$(layout_checksum_for "$(cat sums.txt)" "$IMAGE_NAME")"
           [ -n "$image_sha" ] || {
-            echo "Checksum entry not found for ${IMAGE_NAME}" >&2
+            echo "Checksum entry not found for ${IMAGE_NAME} in ${SHA_FILE}" >&2
             exit 1
           }
           echo "sha=$image_sha" >> "$GITHUB_OUTPUT"
@@ -189,6 +201,9 @@ jobs:
           SOURCES_FILE: ${{ matrix.sources_file }}
           CLOUD_CFG: ${{ matrix.cloud_cfg }}
           SOURCES_FORMAT: ${{ matrix.sources_format }}
+          FAMILY: ${{ matrix.family }}
+          PACKAGES_FILE: ${{ matrix.packages_file }}
+          SYSCTL_FILE: ${{ matrix.sysctl_file }}
         run: sudo -E bash scripts/customize-image.sh
 
       - name: Compress image
