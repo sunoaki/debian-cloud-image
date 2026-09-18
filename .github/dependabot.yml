@@ -1,0 +1,17 @@
+version: 2
+updates:
+  # Actions are pinned to full commit SHAs with the version in a comment, which
+  # is deliberate but also means they never move on their own. This is the
+  # mechanism that keeps the pins current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+    # One PR for the whole bump set: these are pinned by SHA, so separate PRs
+    # would each need the same re-verify pass.
+    groups:
+      actions:
+        patterns:
+          - "*"
