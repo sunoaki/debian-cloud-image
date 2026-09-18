@@ -190,8 +190,10 @@ jobs:
           # reasons unrelated to the image being broken.
           if [ "${FIRMWARE:-bios}" = "efi" ]; then
             firmware=uefi
-            fw_args=(-drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd
-                     -drive if=pflash,format=raw,file=/usr/share/OVMF/OVMF_VARS_4M.fd)
+            # split across lines; shellcheck SC2054 objects to the comma inside
+            # the array element `if=pflash,format=raw,...`
+            fw_args=(-drive "if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd"
+                     -drive "if=pflash,format=raw,file=/usr/share/OVMF/OVMF_VARS_4M.fd")
           else
             firmware=bios
             fw_args=()
@@ -265,7 +267,7 @@ jobs:
           set -euo pipefail
           mapfile -t expected < <(
             printf '%s' "$NAMES" |
-              ruby -rjson -e 'JSON.parse($stdin.read).each { |n| puts "#{n}-pve-sunoaki+#{ENV["RELEASE_TAG"]}.qcow2" }'
+              ruby -rjson -e "JSON.parse(\$stdin.read).each { |n| puts \"#{n}-pve-sunoaki+#{ENV['RELEASE_TAG']}.qcow2\" }"
           )
           for image in "${expected[@]}"; do
             test -s "images/$image" || {
