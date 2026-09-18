@@ -129,7 +129,7 @@ jobs:
             echo "Downloaded image checksum mismatch!" >&2
             exit 1
           }
-          echo "IMAGE_NAME=$IMAGE_NAME" >> "$GITHUB_ENV"
+          echo "SRC_IMAGE=$IMAGE_NAME" >> "$GITHUB_ENV"
           echo "RELEASE_NAME=$RELEASE_NAME" >> "$GITHUB_ENV"
 
       # apt .deb cache keyed on the package list; a fixed key is shared across
@@ -141,9 +141,11 @@ jobs:
           key: apt-debs-${{ matrix.distro }}-${{ matrix.major }}-${{ hashFiles('config/cloud-image-packages.txt') }}
 
       # Host-side plumbing + chroot customization; see scripts/customize-image.sh.
+      # SRC_IMAGE is the freshly downloaded file; the script never writes it in
+      # place, so the name stays distinct from the RELEASE_NAME it produces.
       - name: Customize Image (chroot)
         env:
-          IMAGE_NAME: ${{ matrix.image_name }}
+          SRC_IMAGE: ${{ env.SRC_IMAGE }}
           SOURCES_FILE: ${{ matrix.sources_file }}
           CLOUD_CFG: ${{ matrix.cloud_cfg }}
           SOURCES_FORMAT: ${{ matrix.sources_format }}
@@ -151,8 +153,8 @@ jobs:
 
       - name: Compress image
         run: |
-          sudo qemu-img convert -O qcow2 -c "$IMAGE_NAME" "$RELEASE_NAME"
-          rm -f "$IMAGE_NAME"
+          sudo qemu-img convert -O qcow2 -c "$SRC_IMAGE" "$RELEASE_NAME"
+          rm -f "$SRC_IMAGE"
           echo "IMAGE_NAME=$RELEASE_NAME" >> "$GITHUB_ENV"
 
       - name: Upload artifact
@@ -163,6 +165,46 @@ jobs:
           if-no-files-found: error
           # release is the long-lived artifact; keep the intermediate short
           retention-days: 3
+
+      # Soft verification tier: boot the compressed image and wait for the serial
+      # console to reach a login prompt. KVM is not guaranteed on hosted runners
+      # (GitHub documents nested VMs as unsupported), so this falls back to TCG
+      # and, because TCG is ~10-50x slower, it is advisory: a failure here is
+      # reported but does not fail the build. The hard content assertions live in
+      # scripts/customize-image.sh. Enable with a repo variable BOOT_TEST=true.
+      - name: Boot test (advisory, TCG)
+        if: ${{ vars.BOOT_TEST == 'true' }}
+        continue-on-error: true
+        env:
+          IMAGE: ${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y qemu-system-x86 ovmf
+          accel=tcg
+          [ -r /dev/kvm ] && accel=kvm
+          echo "Using -accel $accel (note: TCG is far slower than KVM)"
+          started=$SECONDS
+          # -serial file: captures the console even though the image also sets up
+          # serial-getty@ttyS1; timeout is generous because TCG speed varies.
+          status=0
+          timeout 900 qemu-system-x86_64 \
+            -machine q35 -accel "$accel" -m 2048 -smp 2 -nographic \
+            -drive file="$IMAGE",if=virtio,format=qcow2 \
+            -serial "file:console.log" || status=$?
+          echo "qemu exited after $((SECONDS - started))s (status $status)"
+          echo "--- last console output ---"
+          tail -n 40 console.log || true
+          grep -qE 'login:|systemd.*Reached target' console.log || {
+            echo "::warning title=Boot test::console did not reach a login prompt after $((SECONDS - started))s on $accel"
+            exit 1
+          }
+          echo "Console reached a login prompt after $((SECONDS - started))s on $accel"
+
+      - name: Summarize build
+        run: |
+          printf '%s\n' \
+            "distro=${{ matrix.distro }} ${{ matrix.major }}" \
+            "image=$(basename "$IMAGE_NAME")"
 
   release:
     needs: [prepare, build, generate-matrix]

@@ -4,14 +4,20 @@
 # qcow2 host-side plumbing: resize, NBD/loop attach, root/boot partition
 # detection, growpart, bind mounts, chroot into the image, then clean teardown.
 # All failure paths unwind through a trap so no NBD/loop/mount is left behind.
+#
+# The image is customized in place under $SRC_IMAGE and never renamed here; the
+# workflow compresses it into its published RELEASE_NAME afterwards. Callers
+# that still pass IMAGE_NAME keep working.
 set -Eeuo pipefail
 
-: "${IMAGE_NAME:?IMAGE_NAME is required}"
+SRC_IMAGE="${SRC_IMAGE:-${IMAGE_NAME:-}}"
+: "${SRC_IMAGE:?SRC_IMAGE (or IMAGE_NAME) is required}"
 : "${SOURCES_FILE:?SOURCES_FILE is required}"
 : "${CLOUD_CFG:?CLOUD_CFG is required}"
 : "${SOURCES_FORMAT:?SOURCES_FORMAT is required}"
 : "${PACKAGES_FILE:-}" # defaults to config/cloud-image-packages.txt in repo root
 : "${SYSCTL_FILE:-}"   # defaults to config/cloud-image-sysctl.conf in repo root
+[ -f "$SRC_IMAGE" ] || { echo "image not found: $SRC_IMAGE" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || { echo "must run as root (workflow: sudo -E bash scripts/customize-image.sh)" >&2; exit 1; }
 
@@ -55,7 +61,7 @@ trap cleanup EXIT
 # partition ends after every other partition on the disk (Ubuntu >= 24.04 puts
 # EFI and /boot *before* it), so the appended space sits directly after root and
 # growpart + resize2fs can extend it.
-qemu-img resize "$IMAGE_NAME" +4G
+qemu-img resize "$SRC_IMAGE" +4G
 
 # Attach the image as a block device. qemu-nbd reads qcow2 directly; fall back
 # to losetup + raw conversion if the nbd module is missing.
@@ -70,16 +76,32 @@ modprobe nbd 2>/dev/null || true
 # A previous interrupted run can leave /dev/nbd0 attached; clear it so the
 # fallback path below is only taken when qemu-nbd is genuinely unusable.
 qemu-nbd -d /dev/nbd0 >/dev/null 2>&1 || true
-if qemu-nbd -c /dev/nbd0 "$IMAGE_NAME"; then
+if qemu-nbd -c /dev/nbd0 "$SRC_IMAGE"; then
   ATTACHED_NBD=true
   DISKDEV=/dev/nbd0
 else
   echo "qemu-nbd unavailable, falling back to losetup..."
-  qemu-img convert -O raw "$IMAGE_NAME" /tmp/disk.raw
+  qemu-img convert -O raw "$SRC_IMAGE" /tmp/disk.raw
   DISKDEV=$(losetup --find --show --partscan /tmp/disk.raw)
 fi
 partprobe "$DISKDEV" || true
-sleep 2 # let udev settle so partition FSTYPE is populated
+
+# Wait for the kernel partition nodes instead of sleeping a fixed 2s: a slow
+# runner may not be ready in time, and a fast one wastes the wait. Poll until
+# the count reported by partx is reached.
+wait_for_partitions() {
+  local want="$1" deadline=$((SECONDS + 30)) got
+  while :; do
+    got=$(compgen -G "${DISKDEV}p*" | wc -l || true)
+    [ "$got" -ge "$want" ] && return 0
+    [ "$SECONDS" -ge "$deadline" ] && return 1
+    sleep 0.2
+  done
+}
+wait_for_partitions "$(partx --show --noheadings "$DISKDEV" 2>/dev/null | wc -l || true)" || {
+  echo "Timed out waiting for partition nodes on $DISKDEV to appear" >&2
+  exit 1
+}
 
 # Guard against a kernel/partition-table slot mismatch. partx reads the table
 # on the device itself, compgen counts the partition nodes the kernel actually
@@ -151,6 +173,11 @@ AVAIL_KB=$(df -Pk "$MNT" | awk 'NR==2 {print $4}')
   exit 1
 }
 
+# Baseline for the post-chroot boot-chain assertion below (see assert_boot_chain).
+BASE_KERNELS=$(compgen -G "$MNT/boot/vmlinuz-*" | wc -l || true)
+BASE_INITRDS=$(compgen -G "$MNT/boot/initrd.img-*" | wc -l || true)
+echo "Boot chain before customization: $BASE_KERNELS kernel(s), $BASE_INITRDS initrd(s)"
+
 # Bind host runtime dirs so apt/dpkg/update-grub work inside the chroot.
 mount --bind /dev "$MNT/dev"
 mount --bind /dev/pts "$MNT/dev/pts"
@@ -181,6 +208,49 @@ chroot "$MNT" /usr/bin/env \
   PACKAGES_FILE=/tmp/cloud-image-packages.txt \
   SYSCTL_FILE=/tmp/cloud-image-sysctl.conf \
   /bin/bash /tmp/customize-rootfs.sh
+
+# Hard verification tier: assert the boot chain landed where the firmware will
+# look. Pre-existing damage is recorded as a baseline before customization and
+# only *regressions* fail, so an image that never had a standalone /boot (or
+# never had a bootloader) is not held to a contract it did not have before.
+# Runs after the chroot because that is when a new kernel/initrd appear.
+kernel_count() {
+  compgen -G "$MNT/boot/vmlinuz-*" | wc -l || true
+}
+initrd_count() {
+  compgen -G "$MNT/boot/initrd.img-*" | wc -l || true
+}
+sync_boot_to_root() {
+  # If the bootloader lives on a separate partition, /boot must be mounted for
+  # grub-mkconfig to reach it. Otherwise the kernel apt just installed sits in
+  # the root filesystem while the real /boot keeps the previous one.
+  [ -d "$MNT/boot/grub" ] || return 0
+  mountpoint -q "$MNT/boot" && return 0
+  echo "Bootloader present at $MNT/boot/grub but /boot is not a separate partition;" >&2
+  echo "the chroot wrote its kernel to the root filesystem instead." >&2
+  exit 1
+}
+assert_boot_chain() {
+  local now_k now_i
+  now_k="$(kernel_count)"
+  now_i="$(initrd_count)"
+  echo "Boot chain: $now_k kernel(s) and $now_i initrd(s) under /boot"
+  if [ "$now_k" -lt "$BASE_KERNELS" ] || [ "$now_i" -lt "$BASE_INITRDS" ]; then
+    echo "Boot chain regressed: $BASE_KERNELS kernel(s) / $BASE_INITRDS initrd(s)" >&2
+    echo "before customization, $now_k / $now_i after. A chroot build writes its" >&2
+    echo "kernel to /boot, so this means the mount layout is wrong." >&2
+    exit 1
+  fi
+  [ "$now_k" -ge 1 ] || {
+    echo "No kernel under /boot after customization; the image could not boot." >&2
+    exit 1
+  }
+}
+
+# Boot-chain assertions run before the apt cache is exported and while /boot (if
+# separate) is still mounted.
+sync_boot_to_root
+assert_boot_chain
 
 # Export downloaded .debs for the cache, then scrub apt state from the image.
 mkdir -p "$REPO_ROOT/.apt-cache"
