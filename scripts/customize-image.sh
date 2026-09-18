@@ -226,7 +226,11 @@ AVAIL_KB=$(df -Pk "$MNT" | awk 'NR==2 {print $4}')
 
 # Baseline for the post-chroot boot-chain assertion below (see assert_boot_chain).
 BASE_KERNELS=$(compgen -G "$MNT/boot/vmlinuz-*" | wc -l || true)
+# initrd naming differs by family: Debian/Ubuntu use initrd.img-<ver>, the RHEL
+# family uses initramfs-<ver>.img. Counting only the Debian spelling made the
+# baseline 0 on Rocky, which would have made the regression check meaningless.
 BASE_INITRDS=$(compgen -G "$MNT/boot/initrd.img-*" | wc -l || true)
+BASE_INITRDS=$((BASE_INITRDS + $(compgen -G "$MNT/boot/initramfs-*.img" | wc -l || true)))
 BASE_BOOT_SEPARATE=false
 [ -n "$BOOTDEV" ] && BASE_BOOT_SEPARATE=true
 echo "Boot chain before customization: $BASE_KERNELS kernel(s), $BASE_INITRDS initrd(s), separate /boot: $BASE_BOOT_SEPARATE"
@@ -238,8 +242,18 @@ mount --bind /proc "$MNT/proc"
 mount --bind /sys "$MNT/sys"
 
 # DNS inside the chroot; restore the original file afterwards.
-RESOLV_BACKUP=/tmp/resolv.conf.orig
-cp -a "$MNT/etc/resolv.conf" "$RESOLV_BACKUP"
+#
+# Rocky ships /etc/resolv.conf as a symlink into a path that only exists once
+# NetworkManager or systemd-resolved has run, so the target is usually absent.
+# `cp -a` on such a link aborts the build ("cannot stat"), so only back up a real
+# regular file and otherwise just replace the link. cleanup() restores the backup
+# only when it exists, and re-creating a symlink is not worth the complexity: the
+# image's own cloud-init/NetworkManager rewrites this file on first boot anyway.
+RESOLV_BACKUP=
+if [ -f "$MNT/etc/resolv.conf" ] && [ ! -L "$MNT/etc/resolv.conf" ]; then
+  RESOLV_BACKUP=/tmp/resolv.conf.orig
+  cp -a "$MNT/etc/resolv.conf" "$RESOLV_BACKUP"
+fi
 rm -f "$MNT/etc/resolv.conf"
 echo "nameserver 1.1.1.1" > "$MNT/etc/resolv.conf"
 
@@ -277,7 +291,11 @@ kernel_count() {
   compgen -G "$MNT/boot/vmlinuz-*" | wc -l || true
 }
 initrd_count() {
-  compgen -G "$MNT/boot/initrd.img-*" | wc -l || true
+  # Both spellings: Debian/Ubuntu initrd.img-<ver>, RHEL initramfs-<ver>.img.
+  local n
+  n=$(compgen -G "$MNT/boot/initrd.img-*" | wc -l || true)
+  n=$((n + $(compgen -G "$MNT/boot/initramfs-*.img" | wc -l || true)))
+  printf '%s\n' "$n"
 }
 assert_boot_chain() {
   local now_k now_i problem
