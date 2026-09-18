@@ -127,8 +127,11 @@ fi
 # Record the partition type GUIDs now that the disk is attached: the advisory
 # boot test in the workflow needs them to choose BIOS or UEFI firmware, and a
 # qcow2 cannot be probed directly (sfdisk reads the container, not the table).
+# partx reads the on-disk table itself; lsblk PARTTYPE depends on udev data that
+# is not reliably populated for nbd devices and returned nothing on a CI run.
 FIRMWARE=
-lsblk -rno PARTTYPE "$DISKDEV" 2>/dev/null | grep -v '^$' > /tmp/parttypes.txt || true
+partx --show --noheadings -o NR,TYPE "$DISKDEV" 2>/dev/null | awk '{print $2}' \
+  | grep -v '^$' > /tmp/parttypes.txt || true
 if [ -s /tmp/parttypes.txt ]; then
   if grep -qi '^c12a7328-f81f-11d2-ba4b-00a0c93ec93b$' /tmp/parttypes.txt; then
     FIRMWARE=efi
@@ -203,7 +206,9 @@ AVAIL_KB=$(df -Pk "$MNT" | awk 'NR==2 {print $4}')
 # Baseline for the post-chroot boot-chain assertion below (see assert_boot_chain).
 BASE_KERNELS=$(compgen -G "$MNT/boot/vmlinuz-*" | wc -l || true)
 BASE_INITRDS=$(compgen -G "$MNT/boot/initrd.img-*" | wc -l || true)
-echo "Boot chain before customization: $BASE_KERNELS kernel(s), $BASE_INITRDS initrd(s)"
+BASE_BOOT_SEPARATE=false
+[ -n "$BOOTDEV" ] && BASE_BOOT_SEPARATE=true
+echo "Boot chain before customization: $BASE_KERNELS kernel(s), $BASE_INITRDS initrd(s), separate /boot: $BASE_BOOT_SEPARATE"
 
 # Bind host runtime dirs so apt/dpkg/update-grub work inside the chroot.
 mount --bind /dev "$MNT/dev"
@@ -236,32 +241,30 @@ chroot "$MNT" /usr/bin/env \
   SYSCTL_FILE=/tmp/cloud-image-sysctl.conf \
   /bin/bash /tmp/customize-rootfs.sh
 
-# Hard verification tier: assert the boot chain landed where the firmware will
-# look. Pre-existing damage is recorded as a baseline before customization and
-# only *regressions* fail, so an image that never had a standalone /boot (or
-# never had a bootloader) is not held to a contract it did not have before.
-# Runs after the chroot because that is when a new kernel/initrd appear.
+# Hard verification tier: confirm the boot chain is where the firmware will look.
+# The failure this guards against is the one observed in production: a partition
+# limit hid the standalone /boot, yet root still mounted, apt still installed a
+# kernel, grub-mkconfig still succeeded (it read the root filesystem's /boot),
+# and the image shipped with a stale bootloader payload. The slot guard above is
+# the primary detector for that; these checks confirm the result.
 kernel_count() {
   compgen -G "$MNT/boot/vmlinuz-*" | wc -l || true
 }
 initrd_count() {
   compgen -G "$MNT/boot/initrd.img-*" | wc -l || true
 }
-sync_boot_to_root() {
-  # If the bootloader lives on a separate partition, /boot must be mounted for
-  # grub-mkconfig to reach it. Otherwise the kernel apt just installed sits in
-  # the root filesystem while the real /boot keeps the previous one.
-  [ -d "$MNT/boot/grub" ] || return 0
-  mountpoint -q "$MNT/boot" && return 0
-  echo "Bootloader present at $MNT/boot/grub but /boot is not a separate partition;" >&2
-  echo "the chroot wrote its kernel to the root filesystem instead." >&2
-  exit 1
-}
 assert_boot_chain() {
   local now_k now_i
   now_k="$(kernel_count)"
   now_i="$(initrd_count)"
   echo "Boot chain: $now_k kernel(s) and $now_i initrd(s) under /boot"
+  # With a separate /boot the kernel must be on that partition, since it is
+  # mounted at $MNT/boot; reaching here with it empty means the mount was stale.
+  if [ "$BASE_BOOT_SEPARATE" = "true" ] && [ "$now_k" -lt 1 ]; then
+    echo "A separate /boot was found and mounted, but no kernel is on it after" >&2
+    echo "customization; the chroot wrote its kernel to the root filesystem." >&2
+    exit 1
+  fi
   if [ "$now_k" -lt "$BASE_KERNELS" ] || [ "$now_i" -lt "$BASE_INITRDS" ]; then
     echo "Boot chain regressed: $BASE_KERNELS kernel(s) / $BASE_INITRDS initrd(s)" >&2
     echo "before customization, $now_k / $now_i after. A chroot build writes its" >&2
@@ -274,9 +277,8 @@ assert_boot_chain() {
   }
 }
 
-# Boot-chain assertions run before the apt cache is exported and while /boot (if
-# separate) is still mounted.
-sync_boot_to_root
+# Boot-chain checks run before the apt cache is exported and while root and any
+# separate /boot are still mounted.
 assert_boot_chain
 
 # Export downloaded .debs for the cache, then scrub apt state from the image.
