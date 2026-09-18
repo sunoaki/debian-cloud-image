@@ -182,23 +182,59 @@ jobs:
           sudo apt-get install -y qemu-system-x86 ovmf
           accel=tcg
           [ -r /dev/kvm ] && accel=kvm
-          echo "Using -accel $accel (note: TCG is far slower than KVM)"
+
+          # Firmware is chosen from the partition type GUIDs recorded by
+          # scripts/customize-image.sh while the disk was attached, because a
+          # qcow2 cannot be probed directly -- sfdisk reads the container and
+          # reports no partition table. Booting with the wrong firmware fails
+          # for reasons unrelated to the image being broken.
+          if [ "$(cat /tmp/firmware.txt 2>/dev/null || echo bios)" = "efi" ]; then
+            firmware=uefi
+            fw_args=(-drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd
+                     -drive if=pflash,format=raw,file=/usr/share/OVMF/OVMF_VARS_4M.fd)
+          else
+            firmware=bios
+            fw_args=()
+          fi
+          echo "Using $firmware firmware with -accel $accel (TCG is far slower than KVM)"
+
           started=$SECONDS
-          # -serial file: captures the console even though the image also sets up
-          # serial-getty@ttyS1; timeout is generous because TCG speed varies.
-          status=0
-          timeout 900 qemu-system-x86_64 \
-            -machine q35 -accel "$accel" -m 2048 -smp 2 -nographic \
+          # Serial goes to a file because the images install serial-getty@ttyS1.
+          # qemu keeps running after boot, so poll the log and stop it the moment
+          # the prompt appears instead of waiting for the process to exit. 600s is
+          # a hang guard with ~4x headroom over the measured baseline: a noble
+          # image reached the login prompt in 150s wall clock on a 2-vCPU TCG run
+          # (the guest clock reported 15.6s), and runner speed varies.
+          rm -f console.log
+          qemu-system-x86_64 \
+            -machine q35,accel="$accel" -m 2048 -smp 2 -nographic \
+            "${fw_args[@]}" \
             -drive file="$IMAGE",if=virtio,format=qcow2 \
-            -serial "file:console.log" || status=$?
-          echo "qemu exited after $((SECONDS - started))s (status $status)"
-          echo "--- last console output ---"
+            -serial "file:console.log" >/dev/null 2>&1 &
+          qpid=$!
+          reached=""
+          while [ $((SECONDS - started)) -lt 600 ]; do
+            # Match the getty prompt, not "Reached target": systemd reaches many
+            # targets long before the system is up, and it colours its output, so
+            # a multi-word target name never matches contiguously anyway. The
+            # prompt it prints is "<host> login: ".
+            if grep -aqE 'login: ' console.log 2>/dev/null; then
+              reached=yes
+              break
+            fi
+            kill -0 "$qpid" 2>/dev/null || break
+            sleep 2
+          done
+          elapsed=$((SECONDS - started))
+          kill -9 "$qpid" 2>/dev/null || true
+          wait "$qpid" 2>/dev/null || true
+          echo "--- last console output (${elapsed}s, ${firmware}/${accel}) ---"
           tail -n 40 console.log || true
-          grep -qE 'login:|systemd.*Reached target' console.log || {
-            echo "::warning title=Boot test::console did not reach a login prompt after $((SECONDS - started))s on $accel"
+          [ -n "$reached" ] || {
+            echo "::warning title=Boot test::console did not reach a login prompt within ${elapsed}s ($firmware/$accel)"
             exit 1
           }
-          echo "Console reached a login prompt after $((SECONDS - started))s on $accel"
+          echo "Console reached a login prompt after ${elapsed}s ($firmware/$accel)"
 
       - name: Summarize build
         run: |

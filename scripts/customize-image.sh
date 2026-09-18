@@ -88,7 +88,14 @@ partprobe "$DISKDEV" || true
 
 # Wait for the kernel partition nodes instead of sleeping a fixed 2s: a slow
 # runner may not be ready in time, and a fast one wastes the wait. Poll until
-# the count reported by partx is reached.
+# the count reported by partx is reached. Reading the table itself can fail
+# (unreadable device, no block layer), so that is a separate hard failure --
+# treating it as "0 partitions expected" would make the poll a no-op.
+table_parts=$(partx --show --noheadings "$DISKDEV" 2>/dev/null | wc -l || true)
+[ "$table_parts" -gt 0 ] || {
+  echo "Could not read a partition table from $DISKDEV" >&2
+  exit 1
+}
 wait_for_partitions() {
   local want="$1" deadline=$((SECONDS + 30)) got
   while :; do
@@ -98,8 +105,8 @@ wait_for_partitions() {
     sleep 0.2
   done
 }
-wait_for_partitions "$(partx --show --noheadings "$DISKDEV" 2>/dev/null | wc -l || true)" || {
-  echo "Timed out waiting for partition nodes on $DISKDEV to appear" >&2
+wait_for_partitions "$table_parts" || {
+  echo "Timed out waiting for the $table_parts partition node(s) of $DISKDEV to appear" >&2
   exit 1
 }
 
@@ -109,13 +116,29 @@ wait_for_partitions "$(partx --show --noheadings "$DISKDEV" 2>/dev/null | wc -l 
 # missing nodes would silently drop the /boot partition and the only symptom
 # would be a bootloader written to the wrong filesystem. Fail loudly instead.
 # compgen -G leaves its non-zero status for a no-match, hence the `|| true`.
-table_parts=$(partx --show --noheadings "$DISKDEV" 2>/dev/null | wc -l || true)
 kernel_parts=$(compgen -G "${DISKDEV}p*" | wc -l || true)
 if [ "$kernel_parts" -lt "$table_parts" ]; then
   echo "Only $kernel_parts of $table_parts partitions on $DISKDEV are visible to the kernel;" >&2
   echo "a partition would be skipped, so refusing to continue." >&2
   partx --show "$DISKDEV" >&2 2>/dev/null || true
   exit 1
+fi
+
+# Record the partition type GUIDs now that the disk is attached: the advisory
+# boot test in the workflow needs them to choose BIOS or UEFI firmware, and a
+# qcow2 cannot be probed directly (sfdisk reads the container, not the table).
+# /tmp is on the same runner for the rest of the job.
+lsblk -rno PARTTYPE "$DISKDEV" 2>/dev/null | grep -v '^$' > /tmp/parttypes.txt || true
+if [ -s /tmp/parttypes.txt ]; then
+  if grep -qi '^c12a7328-f81f-11d2-ba4b-00a0c93ec93b$' /tmp/parttypes.txt; then
+    echo "efi" > /tmp/firmware.txt
+  else
+    echo "bios" > /tmp/firmware.txt
+  fi
+  echo "Firmware for boot test: $(cat /tmp/firmware.txt) (from $(wc -l < /tmp/parttypes.txt) partition type GUIDs)"
+else
+  rm -f /tmp/firmware.txt
+  echo "WARN: could not read partition type GUIDs; boot test will fall back to BIOS" >&2
 fi
 
 # Detect the real root partition by mounting each candidate and checking for

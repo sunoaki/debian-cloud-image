@@ -201,7 +201,27 @@ C1 的**故障后果**（新内核写进 root 分区而非 `/boot` 后 PVE 上�
 - `continue-on-error: true`：失败只打 `::warning::`，不卡发布。理由是调研已证 KVM 不保证（GitHub 官方称 nested VM 不受支持），且 TCG 慢 10–50 倍。
 - 有 `/dev/kvm` 且可读时用 `-accel kvm`，否则 `-accel tcg`，并打印实际使用的加速方式。
 - 安装 `qemu-system-x86` 与 `ovmf`（已核实 `qemu-utils` 不含任何系统模拟器，跑 VM 必须另装该包）。
-- **不设超时阈值判据**：`timeout 900` 只是防挂死的上限，判据是串口日志里出现 `login:` 或 `Reached target`，并把实际耗时打印出来。首次真实运行后应据此把耗时记入本报告，再决定要不要收紧。
+- **超时阈值已按实测设定**：600s 挂死上限（约为实测基线的 4 倍）。判据是串口日志出现 `<host> login: `，一到就结束 qemu。实测：BIOS 与 UEFI 两条路径都在 **150s / 149s** 墙钟内到达 login prompt（见下方实测记录）。
+
+### 2b. 启动验证的本地实测（本机 TCG，非 runner）
+
+本机装有 `qemu-system-x86_64` 11.1.1 与 OVMF，且 TCG 不需要 root，因此**软性档的两条固件路径都在本地真跑过**，用的是官方 `noble-server-cloudimg-amd64.img`（597 MB，未经本项目定制）：
+
+| 路径 | 固件参数 | 结果 | 墙钟 |
+|---|---|---|---|
+| BIOS | 无 pflash | 到达 `Ubuntu 24.04.5 LTS ubuntu ttyS0` + `ubuntu login: ` | **150s** |
+| UEFI | `OVMF_CODE_4M.fd` + `OVMF_VARS_4M.fd` | 同上 | **149s** |
+
+guest 自身的内核计时为 15.6s（BIOS）与 17.7s（UEFI），与墙钟 150s 的差距即 TCG 相对本机 CPU 的慢速倍数。
+
+**实测中发现并修掉了我自己引入的四个缺陷**（若不实测不会发现）：
+
+1. **`Reached target` 不是可靠判据**：它在 guest 启动到 6 秒时就命中（`Reached target integritysetup.target`），把「还在启动中」误判为已到 login。已改为只匹配 `login: `。
+2. **systemd 输出带颜色转义**，`Reached target Login Prompts` 这类多词目标名在日志里被转义序列切断，永远匹配不到。这是第 1 点的根因之一。
+3. **qemu 启动后不会自行退出**（停在 login 提示等待输入），原先 `timeout 900 qemu ...` 会让每个发行版白等满 900 秒。已改为后台启动 + 轮询日志 + 命中即 `kill`。
+4. **`sfdisk` 无法解析 qcow2**（它读的是容器本身，报「不包含可识别的分区表」），原先靠在 workflow 里探测分区类型来选固件会恒定判为 BIOS。已改为在 `customize-image.sh` 里趁磁盘挂在 nbd 上时用 `lsblk -rno PARTTYPE` 记录，写入 `/tmp/firmware.txt` 供后续步骤读取。
+
+另外确认了一件之前不确定的事：`-serial file:` **可写**（早先担心的 EACCES 存在，实测无此问题；79920 字节日志正常写入）。
 
 ### 3. `IMAGE_NAME` 解耦
 
