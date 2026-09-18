@@ -91,7 +91,9 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-utils cloud-guest-utils wget
+          # xfsprogs provides xfs_growfs, which the XFS roots (Rocky, CentOS)
+          # need; e2fsprogs (resize2fs) is already present on the runner image.
+          sudo apt-get install -y qemu-utils cloud-guest-utils wget xfsprogs
 
       # Split in two so the ~600 MB image can be cached on its *checksum*: the
       # checksum has to be fetched before a stable cache key exists, and a hit

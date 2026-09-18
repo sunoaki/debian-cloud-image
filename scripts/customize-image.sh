@@ -205,6 +205,12 @@ if [ -n "$BOOTDEV" ]; then
 fi
 
 if [ "$GROW_RECIPE" = "mounted" ]; then
+  command -v xfs_growfs >/dev/null 2>&1 || {
+    echo "Root is ${ROOT_FS} but xfs_growfs is not installed on this runner;" >&2
+    echo "install xfsprogs, or the resize silently does nothing and the chroot" >&2
+    echo "install later fails with ENOSPC." >&2
+    exit 1
+  }
   case "$ROOT_FS" in
   xfs) xfs_growfs "$MNT" >/dev/null ;;
   esac
