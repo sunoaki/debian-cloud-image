@@ -28,6 +28,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
+      names: ${{ steps.matrix.outputs.names }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -35,7 +36,18 @@ jobs:
       - name: Emit matrix JSON
         id: matrix
         run: |
-          echo "matrix=$(ruby -ryaml -rjson -e 'puts JSON.generate(YAML.load_file("config/images.yaml")["images"])')" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          # Emit the matrix and, separately, the "<distro>-<major>" artifact
+          # names so the release job verifies the actual configured set instead
+          # of a hand-maintained list that silently breaks when a distro is
+          # added (the whole point of the yaml-driven matrix).
+          ruby -ryaml -rjson -e '
+            images = YAML.load_file("config/images.yaml")["images"]
+            File.open(ENV["GITHUB_OUTPUT"], "a") do |f|
+              f.puts "matrix=#{JSON.generate(images)}"
+              f.puts "names=#{JSON.generate(images.map { |i| "#{i["distro"]}-#{i["major"]}" })}"
+            end
+          '
 
   # Compute the release tag once so build and release agree even across a UTC
   # midnight rollover, and allow a manual override for re-runs.
@@ -71,7 +83,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-utils parted cloud-guest-utils wget
+          sudo apt-get install -y qemu-utils cloud-guest-utils wget
 
       - name: Download Cloud Image with checksum
         env:
@@ -153,7 +165,7 @@ jobs:
           retention-days: 3
 
   release:
-    needs: [prepare, build]
+    needs: [prepare, build, generate-matrix]
     if: ${{ needs.build.result == 'success' }}
     runs-on: ubuntu-24.04
     permissions:
@@ -165,17 +177,17 @@ jobs:
           path: ./images
           merge-multiple: true
 
+      # The expected set comes from config/images.yaml, so adding a distro needs
+      # no edit here. A hardcoded list silently rejected any new entry.
       - name: Verify release contents
         env:
           RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          NAMES: ${{ needs.generate-matrix.outputs.names }}
         run: |
           set -euo pipefail
-          expected=(
-            "debian-12-pve-sunoaki+${RELEASE_TAG}.qcow2"
-            "debian-13-pve-sunoaki+${RELEASE_TAG}.qcow2"
-            "ubuntu-22.04-pve-sunoaki+${RELEASE_TAG}.qcow2"
-            "ubuntu-24.04-pve-sunoaki+${RELEASE_TAG}.qcow2"
-            "ubuntu-26.04-pve-sunoaki+${RELEASE_TAG}.qcow2"
+          mapfile -t expected < <(
+            printf '%s' "$NAMES" |
+              ruby -rjson -e 'JSON.parse($stdin.read).each { |n| puts "#{n}-pve-sunoaki+#{ENV["RELEASE_TAG"]}.qcow2" }'
           )
           for image in "${expected[@]}"; do
             test -s "images/$image" || {
@@ -185,7 +197,7 @@ jobs:
           done
           actual="$(find images -maxdepth 1 -type f -name '*.qcow2' | wc -l)"
           test "$actual" -eq "${#expected[@]}" || {
-            echo "Unexpected qcow2 artifact count: $actual" >&2
+            echo "Expected ${#expected[@]} qcow2 artifacts, found $actual" >&2
             exit 1
           }
 
@@ -214,10 +226,16 @@ jobs:
             done
           # gh release create publishes immediately; softprops/action-gh-release
           # can leave the release stuck as an untagged draft (observed 2026-08-01).
+          # The image list in the notes is built from the artifacts actually
+          # released, so it cannot drift from config/images.yaml either.
+          notes="Proxmox VE cloud images for $RELEASE_TAG"$'\n\n'
+          for f in ./images/*.qcow2; do
+            notes+="- $(basename "$f")"$'\n'
+          done
           gh release create "$RELEASE_TAG" ./images/*.qcow2 \
             -R "$GITHUB_REPOSITORY" \
             --title "PVE Cloud Images $RELEASE_TAG" \
-            --notes "Proxmox VE cloud images for $RELEASE_TAG (debian-12/13, ubuntu-22.04/24.04/26.04)"
+            --notes "$notes"
 
   notify:
     needs: [prepare, build, release]
