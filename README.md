@@ -28,7 +28,7 @@ Release tag 为 `YYYYMMDD`；同一天重复构建会先删除当天的旧 Relea
 - root + SSH 密码登录：cloud-init `disable_root: false`、`ssh_pwauth: true`，sshd `PermitRootLogin yes`。配合 PVE cloud-init 默认配置（user=root + 设置密码）即可直接密码登录
 - BBR + TCP 调优：`fq` qdisc、`tcp_slow_start_after_idle=0`、`tcp_fastopen=3`
 
-> **安全提示**：镜像默认允许 root 使用密码登录（`PermitRootLogin yes` + `ssh_pwauth: true`），密码由 PVE cloud-init 下发。Release 是公开可下载的，因此请只在受控网络（内网 / 安全组限制来源 IP）里使用这些模板；对外暴露前请改用密钥认证并在 PVE 侧关闭密码登录。
+> **安全提示**：镜像里的 root 密码默认是**锁定**的（`/etc/shadow` 中为 `*`，实测空密码无法通过串口或 SSH 登录），但镜像已放开 `PermitRootLogin yes`、`ssh_pwauth: true`、`disable_root: false`，Ubuntu 的默认用户也被改名为 `root`。因此一旦用 PVE cloud-init 给 root 下发密码，密码登录立即可用——且 Release 是公开可下载的。请只在受控网络（内网 / 安全组限制来源 IP）里使用这些模板；对外暴露前请改用密钥认证并在 PVE 侧关闭密码登录。
 
 ## 触发构建
 

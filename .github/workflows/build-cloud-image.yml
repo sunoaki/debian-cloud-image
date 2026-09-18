@@ -85,16 +85,60 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-utils cloud-guest-utils wget
 
-      - name: Download Cloud Image with checksum
+      # Split in two so the ~600 MB image can be cached on its *checksum*: the
+      # checksum has to be fetched before a stable cache key exists, and a hit
+      # then skips the download entirely. Previously only the apt .debs were
+      # cached and every run re-fetched ~3 GB across the matrix.
+      - name: Fetch expected checksum
+        id: sums
         env:
           BASE_URL: ${{ matrix.base_url }}
           SHA_FILE: ${{ matrix.sha_file }}
-          HASH_CMD: ${{ matrix.hash_cmd }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
         run: |
           set -euo pipefail
           IMAGE_NAME="${{ matrix.image_name }}"
-          RELEASE_NAME="${{ matrix.distro }}-${{ matrix.major }}-pve-sunoaki+${RELEASE_TAG}.qcow2"
+          fetch_retry() {
+            local url="$1" out="$2" attempt=1
+            until wget --tries=3 --retry-connrefused --waitretry=2 -O "$out" "$url" 2>&1; do
+              if [ "$attempt" -ge 5 ]; then
+                echo "Download failed after $attempt attempts: $url" >&2
+                return 1
+              fi
+              echo "Attempt $attempt failed, retrying in 5s: $url" >&2
+              sleep 5
+              attempt=$((attempt + 1))
+            done
+          }
+          fetch_retry "${BASE_URL}/${SHA_FILE}" "sha512.sum"
+          image_sha="$(awk -v f="$IMAGE_NAME" '$2 == f || $2 == "*" f { print $1; exit }' sha512.sum)"
+          [ -n "$image_sha" ] || {
+            echo "Checksum entry not found for ${IMAGE_NAME}" >&2
+            exit 1
+          }
+          echo "sha=$image_sha" >> "$GITHUB_OUTPUT"
+          echo "SRC_IMAGE=$IMAGE_NAME" >> "$GITHUB_ENV"
+          echo "RELEASE_NAME=${{ matrix.distro }}-${{ matrix.major }}-pve-sunoaki+${{ needs.prepare.outputs.release_tag }}.qcow2" >> "$GITHUB_ENV"
+
+      - name: Restore cloud image cache
+        id: image-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ matrix.image_name }}
+          # Keyed on the upstream checksum, so an unchanged image is a hit and a
+          # rebuilt upstream image gets a fresh download. The checksum is the
+          # prefix so an ancient cache entry is still preferred over nothing.
+          key: cloud-image-${{ matrix.distro }}-${{ matrix.major }}-${{ steps.sums.outputs.sha }}
+          restore-keys: cloud-image-${{ matrix.distro }}-${{ matrix.major }}-
+
+      - name: Download Cloud Image with checksum
+        env:
+          BASE_URL: ${{ matrix.base_url }}
+          HASH_CMD: ${{ matrix.hash_cmd }}
+          EXPECTED_SHA: ${{ steps.sums.outputs.sha }}
+          CACHE_HIT: ${{ steps.image-cache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          IMAGE_NAME="${{ matrix.image_name }}"
 
           # Download with retries: cloud.debian.org is GeoDNS-fronted and
           # picks different mirrors per runner egress IP; freshly published
@@ -113,24 +157,20 @@ jobs:
             done
           }
 
-          # Exact checksum lookup ($2 == file or "$2 == *file"), fail loudly
-          # instead of grepping with regex/substring surprises.
-          fetch_retry "${BASE_URL}/${SHA_FILE}" "sha512.sum"
-          image_sha="$(awk -v f="$IMAGE_NAME" '$2 == f || $2 == "*" f { print $1; exit }' sha512.sum)"
-          [ -n "$image_sha" ] || {
-            echo "Checksum entry not found for ${IMAGE_NAME}" >&2
-            exit 1
-          }
-
-          echo "Downloading image..."
-          fetch_retry "${BASE_URL}/${IMAGE_NAME}" "$IMAGE_NAME"
+          if [ "$CACHE_HIT" = "true" ]; then
+            echo "Using cached ${IMAGE_NAME}"
+          else
+            echo "Downloading image..."
+            fetch_retry "${BASE_URL}/${IMAGE_NAME}" "$IMAGE_NAME"
+          fi
+          # Verify the checksum on every run, cached or not: a cache entry could
+          # be truncated, and this is the one place the bytes are checked.
           dl_sha="$(${HASH_CMD} "$IMAGE_NAME" | awk '{print $1}')"
-          [ "$dl_sha" = "$image_sha" ] || {
-            echo "Downloaded image checksum mismatch!" >&2
+          [ "$dl_sha" = "$EXPECTED_SHA" ] || {
+            echo "Image checksum mismatch for ${IMAGE_NAME}: expected ${EXPECTED_SHA}, got ${dl_sha}" >&2
+            [ "$CACHE_HIT" = "true" ] && rm -f "$IMAGE_NAME"
             exit 1
           }
-          echo "SRC_IMAGE=$IMAGE_NAME" >> "$GITHUB_ENV"
-          echo "RELEASE_NAME=$RELEASE_NAME" >> "$GITHUB_ENV"
 
       # apt .deb cache keyed on the package list; a fixed key is shared across
       # dates (no run_id) so rebuilds and same-day reruns actually hit it.

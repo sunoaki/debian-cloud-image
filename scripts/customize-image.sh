@@ -28,6 +28,11 @@ SYSCTL_FILE="${SYSCTL_FILE:-$REPO_ROOT/config/cloud-image-sysctl.conf}"
 [ -f "$PACKAGES_FILE" ] || { echo "packages file not found: $PACKAGES_FILE" >&2; exit 1; }
 [ -f "$SYSCTL_FILE" ] || { echo "sysctl file not found: $SYSCTL_FILE" >&2; exit 1; }
 
+# Layout decisions live in a separate sourced file so they are unit-testable;
+# see test/partition-layout.bats. Those rules have been wrong before.
+# shellcheck source=scripts/partition-layout.sh
+. "$SCRIPT_DIR/partition-layout.sh"
+
 MNT=/mnt/img
 DISKDEV=
 BOOTDEV=
@@ -117,7 +122,7 @@ wait_for_partitions "$table_parts" || {
 # would be a bootloader written to the wrong filesystem. Fail loudly instead.
 # compgen -G leaves its non-zero status for a no-match, hence the `|| true`.
 kernel_parts=$(compgen -G "${DISKDEV}p*" | wc -l || true)
-if [ "$kernel_parts" -lt "$table_parts" ]; then
+if ! layout_slots_sufficient "$kernel_parts" "$table_parts"; then
   echo "Only $kernel_parts of $table_parts partitions on $DISKDEV are visible to the kernel;" >&2
   echo "a partition would be skipped, so refusing to continue." >&2
   partx --show "$DISKDEV" >&2 2>/dev/null || true
@@ -129,16 +134,10 @@ fi
 # qcow2 cannot be probed directly (sfdisk reads the container, not the table).
 # partx reads the on-disk table itself; lsblk PARTTYPE depends on udev data that
 # is not reliably populated for nbd devices and returned nothing on a CI run.
-FIRMWARE=
-partx --show --noheadings -o NR,TYPE "$DISKDEV" 2>/dev/null | awk '{print $2}' \
-  | grep -v '^$' > /tmp/parttypes.txt || true
-if [ -s /tmp/parttypes.txt ]; then
-  if grep -qi '^c12a7328-f81f-11d2-ba4b-00a0c93ec93b$' /tmp/parttypes.txt; then
-    FIRMWARE=efi
-  else
-    FIRMWARE=bios
-  fi
-  echo "Firmware for boot test: $FIRMWARE (from $(wc -l < /tmp/parttypes.txt) partition type GUIDs)"
+PARTTYPES=$(partx --show --noheadings -o NR,TYPE "$DISKDEV" 2>/dev/null | awk '{print $2}' | grep -v '^$' || true)
+FIRMWARE=$(layout_firmware "$PARTTYPES")
+if [ -n "$FIRMWARE" ]; then
+  echo "Firmware for boot test: $FIRMWARE (from $(printf '%s\n' "$PARTTYPES" | wc -l) partition type GUIDs)"
 else
   echo "WARN: could not read partition type GUIDs; boot test will fall back to BIOS" >&2
 fi
@@ -150,25 +149,20 @@ fi
 
 # Detect the real root partition by mounting each candidate and checking for
 # /etc. Layouts differ: Debian 12/13 and Ubuntu 22.04 use a single ext4 p1;
-# Ubuntu >= 24.04 also uses p1 as root but puts a standalone /boot on p16 with
-# EFI on p15. Root is therefore identified by content, not by partition number.
+# Ubuntu 24.04 also uses p1 as root but puts a standalone /boot on p16 (26.04
+# uses p13). Root is therefore identified by content, not by partition number.
 # blkid reads devices directly (no udev cache); lsblk is the fallback.
-CANDIDATES=$(blkid | awk -F: -v d="$DISKDEV" 'index($1,d)==1 && $0 ~ /TYPE="(ext4|xfs|btrfs)"/ {sub(/:/,"",$1); print $1}')
+CANDIDATES=$(layout_candidates_from_blkid "$DISKDEV" "$(blkid)")
 if [ -z "$CANDIDATES" ]; then
-  CANDIDATES=$(lsblk -rno NAME,FSTYPE "$DISKDEV" | awk '$2=="ext4" {print "/dev/"$1}')
+  CANDIDATES=$(layout_candidates_from_lsblk "$(lsblk -rno NAME,FSTYPE "$DISKDEV")")
 fi
 mkdir -p /tmp/probe
 for dev in $CANDIDATES; do
   if mount "$dev" /tmp/probe >/dev/null 2>&1; then
-    if [ -d /tmp/probe/etc ] && [ -z "$ROOTDEV" ]; then
-      ROOTDEV="$dev"
-      echo "Root partition: $dev"
-    elif [ -d /tmp/probe/grub ] && [ -z "$BOOTDEV" ]; then
-      # A standalone /boot partition has grub/ at its top level, unlike a root
-      # partition where it lives under /boot/grub.
-      BOOTDEV="$dev"
-      echo "Boot partition: $dev"
-    fi
+    case "$(layout_classify_mount /tmp/probe)" in
+      root) [ -z "$ROOTDEV" ] && { ROOTDEV="$dev"; echo "Root partition: $dev"; } ;;
+      boot) [ -z "$BOOTDEV" ] && { BOOTDEV="$dev"; echo "Boot partition: $dev"; } ;;
+    esac
     umount /tmp/probe
   fi
 done
@@ -254,27 +248,18 @@ initrd_count() {
   compgen -G "$MNT/boot/initrd.img-*" | wc -l || true
 }
 assert_boot_chain() {
-  local now_k now_i
+  local now_k now_i problem
   now_k="$(kernel_count)"
   now_i="$(initrd_count)"
   echo "Boot chain: $now_k kernel(s) and $now_i initrd(s) under /boot"
-  # With a separate /boot the kernel must be on that partition, since it is
-  # mounted at $MNT/boot; reaching here with it empty means the mount was stale.
-  if [ "$BASE_BOOT_SEPARATE" = "true" ] && [ "$now_k" -lt 1 ]; then
-    echo "A separate /boot was found and mounted, but no kernel is on it after" >&2
-    echo "customization; the chroot wrote its kernel to the root filesystem." >&2
+  problem="$(layout_boot_chain_problem "$BASE_KERNELS" "$BASE_INITRDS" \
+    "$BASE_BOOT_SEPARATE" "$now_k" "$now_i")"
+  if [ -n "$problem" ]; then
+    echo "Boot chain check failed: $problem" >&2
+    echo "The chroot writes its kernel into /boot, so this means the mount layout" >&2
+    echo "is wrong; see test/partition-layout.bats for the cases this covers." >&2
     exit 1
   fi
-  if [ "$now_k" -lt "$BASE_KERNELS" ] || [ "$now_i" -lt "$BASE_INITRDS" ]; then
-    echo "Boot chain regressed: $BASE_KERNELS kernel(s) / $BASE_INITRDS initrd(s)" >&2
-    echo "before customization, $now_k / $now_i after. A chroot build writes its" >&2
-    echo "kernel to /boot, so this means the mount layout is wrong." >&2
-    exit 1
-  fi
-  [ "$now_k" -ge 1 ] || {
-    echo "No kernel under /boot after customization; the image could not boot." >&2
-    exit 1
-  }
 }
 
 # Boot-chain checks run before the apt cache is exported and while root and any
