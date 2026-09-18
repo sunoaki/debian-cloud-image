@@ -62,11 +62,14 @@ configure_cloud_cfg() {
 
   # Keep the apt sources that PVE swaps in after download: without this Ubuntu
   # cloud-init regenerates sources.list(.d) on first boot and clobbers the
-  # xtom HK mirror. The top-level apt_preserve_sources_list name is converted by
-  # cloud-init (cc_apt_configure: convert_to_v3_apt_format) into
-  # apt.preserve_sources_list, so this spelling is the supported one.
+  # xtom HK mirror. Use the nested form: the older top-level
+  # apt_preserve_sources_list is still accepted (cc_apt_configure converts it)
+  # but logs a deprecation warning on every boot and is due for removal, which a
+  # live guest confirmed:
+  #   The following config key(s): ['apt_preserve_sources_list'] is deprecated
+  #   in 22.1 and scheduled to be removed in 27.1.
   mkdir -p "$(root_path /etc/cloud/cloud.cfg.d)"
-  printf 'apt_preserve_sources_list: true\n' > "$(root_path /etc/cloud/cloud.cfg.d/99-pve-apt.cfg)"
+  printf 'apt:\n  preserve_sources_list: true\n' > "$(root_path /etc/cloud/cloud.cfg.d/99-pve-apt.cfg)"
 }
 
 install_packages() {
