@@ -341,3 +341,72 @@ rhel_setup() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"skipping the os-prober tweak"* ]]
 }
+
+# --- BLS entries must not reference a build-time PARTUUID --------------------
+
+# The shipped Rocky image booted into a dracut emergency shell:
+#   /dev/disk/by-partuuid/580b80dc-... does not exist
+# because dnf's kernel-install wrote BLS entries using the PARTUUID the *build*
+# kernel saw, which the finished image does not have. GRUB boots the newest
+# entry, so the image was unbootable while every kernel/initrd count was correct.
+bls_setup() {
+  rhel_setup
+  mkdir -p "$ROOT/etc" "$ROOT/boot/loader/entries"
+  printf 'UUID=5c547c15-e655-458f-bc8e-b2877acc2676 / xfs defaults 0 1\n' > "$ROOT/etc/fstab"
+  # grub2-mkconfig does not exist in the test environment
+  grub2-mkconfig() { :; }
+}
+
+@test "a PARTUUID root reference in a BLS entry is rewritten to the fstab UUID" {
+  bls_setup
+  printf 'options root=PARTUUID=580b80dc-f54b-4d06-9389-f702fab8bd92 ro\n' \
+    > "$ROOT/boot/loader/entries/entry.conf"
+
+  run family_update_bootloader
+
+  [ "$status" -eq 0 ]
+  grep -q 'root=UUID=5c547c15-e655-458f-bc8e-b2877acc2676' "$ROOT/boot/loader/entries/entry.conf"
+  ! grep -q 'PARTUUID' "$ROOT/boot/loader/entries/entry.conf"
+}
+
+@test "an already-correct UUID root reference is left alone" {
+  bls_setup
+  printf 'options root=UUID=5c547c15-e655-458f-bc8e-b2877acc2676 ro\n' \
+    > "$ROOT/boot/loader/entries/entry.conf"
+
+  run family_update_bootloader
+
+  [ "$status" -eq 0 ]
+  [ "$(grep -c 'root=UUID=5c547c15' "$ROOT/boot/loader/entries/entry.conf")" -eq 1 ]
+}
+
+@test "several entries are all rewritten" {
+  bls_setup
+  printf 'options root=PARTUUID=aaaa-1 ro\n' > "$ROOT/boot/loader/entries/a.conf"
+  printf 'options root=PARTUUID=bbbb-2 ro\n' > "$ROOT/boot/loader/entries/b.conf"
+
+  run family_update_bootloader
+
+  [ "$status" -eq 0 ]
+  ! grep -rq 'PARTUUID' "$ROOT/boot/loader/entries/"
+}
+
+@test "a missing fstab root entry warns and does not touch the entries" {
+  bls_setup
+  printf 'tmpfs /tmp tmpfs defaults 0 0\n' > "$ROOT/etc/fstab"
+  printf 'options root=PARTUUID=580b80dc ro\n' > "$ROOT/boot/loader/entries/entry.conf"
+
+  run family_update_bootloader
+
+  [[ "$output" == *"leaving BLS entries alone"* ]]
+}
+
+@test "images without BLS entries are unaffected" {
+  bls_setup
+  rm -rf "$ROOT/boot/loader/entries"
+
+  run family_update_bootloader
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"No BLS entries to check"* ]]
+}

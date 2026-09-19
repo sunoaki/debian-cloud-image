@@ -253,6 +253,11 @@ jobs:
           sudo apt-get install -y qemu-system-x86 ovmf
           accel=tcg
           [ -r /dev/kvm ] && accel=kvm
+          # -cpu max: the RHEL family's glibc is built for x86-64-v2 and aborts
+          # with "Fatal glibc error: CPU does not ..." under qemu's default CPU
+          # model, which panics init and looks like an unbootable image. Measured
+          # on a stock Rocky 9 image: default model -> kernel panic, -cpu max ->
+          # login prompt.
 
           # Firmware is chosen from the partition type GUIDs that
           # scripts/customize-image.sh read while the disk was attached, because
@@ -289,7 +294,7 @@ jobs:
           # was unusable the only symptom was "did not reach a login prompt in 2s"
           # with no console.log -- which says nothing about the actual cause.
           qemu-system-x86_64 \
-            -machine q35,accel="$accel" -m 2048 -smp 2 -nographic \
+            -machine q35,accel="$accel" -cpu max -m 2048 -smp 2 -nographic \
             "${fw_args[@]}" \
             -drive file="$IMAGE",if=virtio,format=qcow2 \
             -serial "file:console.log" >qemu.log 2>&1 &
@@ -323,7 +328,7 @@ jobs:
               echo "Retrying with -accel tcg"
               rm -f console.log
               qemu-system-x86_64 \
-                -machine q35,accel=tcg -m 2048 -smp 2 -nographic \
+                -machine q35,accel=tcg -cpu max -m 2048 -smp 2 -nographic \
                 "${fw_args[@]}" \
                 -drive file="$IMAGE",if=virtio,format=qcow2 \
                 -serial "file:console.log" >qemu.log 2>&1 &
