@@ -278,7 +278,13 @@ install -m 0644 "$SCRIPT_DIR/family/"*.sh "$MNT/tmp/family/"
 # `env VAR=...`: CentOS 7 ships coreutils 8.22, and while its `env` handles the
 # plain form fine, exporting keeps the construct readable and side-steps the
 # question entirely.
-export SOURCES_FILE CLOUD_CFG SOURCES_FORMAT FAMILY
+# FIRMWARE is needed inside the chroot too: grub2-mkconfig picks its platform
+# from what it can see, and inside our chroot that is the *runner's* view, not the
+# image's. It generated `linuxefi` for a BIOS-only CentOS 7 image, which GRUB then
+# could not run ("error: can't find command `linuxefi'"), leaving an image that
+# could not boot. Passing the firmware we already detected from the partition
+# table lets the family hook pin the generated config to the real platform.
+export SOURCES_FILE CLOUD_CFG SOURCES_FORMAT FAMILY FIRMWARE
 export PACKAGES_FILE=/tmp/cloud-image-packages.txt
 export SYSCTL_FILE=/tmp/cloud-image-sysctl.conf
 export FAMILY_DIR=/tmp/family

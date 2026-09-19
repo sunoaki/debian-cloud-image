@@ -139,6 +139,10 @@ configure_system() {
   family_configure_ntp
 
   configure_cloud_cfg
+  # A family may add its own notices (CentOS 7 announces its end of life). Called
+  # before the sshd work so the files land in the same /etc/motd.d the security
+  # notice uses.
+  family_eol_notice
   mkdir -p "$(root_path /etc/ssh/sshd_config.d)"
   printf 'PermitRootLogin yes\n' > "$(root_path /etc/ssh/sshd_config.d/99-pve-root-login.conf)"
   # A drop-in directory only takes effect if sshd_config includes it. RHEL-family
@@ -163,11 +167,25 @@ before exposing it. To disable password login:
     printf 'PermitRootLogin prohibit-password\n' > /etc/ssh/sshd_config.d/99-pve-root-login.conf
     systemctl reload $(family_ssh_unit)
 MOTD
-  # CentOS 7's pam_motd has no motd.d support, so mirror the notice into /etc/motd
-  # as well; on the other families /etc/motd is the lower-priority file and the
-  # motd.d drop-in above wins, so this stays harmless.
-  if ! grep -qs 'motd\.d' "$(root_path /etc/pam.d/sshd)" 2>/dev/null; then
-    cat "$(root_path /etc/motd.d/99-pve-security)" >> "$(root_path /etc/motd)"
+  # CentOS 7's pam_motd predates motd.d support, so a notice living only in
+  # /etc/motd.d would never be displayed there. Mirror the notices into
+  # /etc/motd as well.
+  #
+  # Detection must look for the *directory* /etc/motd.d, not the substring
+  # "motd.d": Debian's pam line is `motd=/run/motd.dynamic`, which contains that
+  # substring and made this condition wrongly conclude motd.d was supported.
+  if ! grep -qs '/etc/motd\.d\|motd_dir=' "$(root_path /etc/pam.d/sshd)" 2>/dev/null; then
+    # A family may need to be told to consult pam_motd at all (the RHEL family does
+  # not call it, so notices would otherwise never be shown).
+  family_enable_motd
+
+  # Every notice in motd.d, in the same lexicographic order pam_motd would use.
+    # Create /etc/motd first: an image need not ship one, and appending to a
+    # missing file aborts the build.
+    touch "$(root_path /etc/motd)"
+    for m in "$(root_path /etc/motd.d)"/*; do
+      [ -f "$m" ] && cat "$m" >> "$(root_path /etc/motd)"
+    done
   fi
 
   # BBR + kernel tuning. One template per family: CentOS 7's 3.10 kernel has no

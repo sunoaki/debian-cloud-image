@@ -283,22 +283,6 @@ rhel_setup() {
   grep -q '^tcp_bbr$' "$ROOT/etc/modules-load.d/bbr.conf"
 }
 
-# Build-time relabel is impossible on the runner (measured: security.selinux
-# writes return EPERM even as uid 0 with all capabilities, because the kernel has
-# SELinux compiled in but not enabled). The image therefore carries
-# /.autorelabel and relabels on first boot instead.
-@test "rhel defers the SELinux relabel to first boot" {
-  rhel_setup
-  mkdir -p "$ROOT/etc/selinux/targeted/contexts/files"
-  : > "$ROOT/etc/selinux/targeted/contexts/files/file_contexts"
-
-  run family_relabel
-
-  [ "$status" -eq 0 ]
-  [ -f "$ROOT/.autorelabel" ]
-  grep -q '^-F$' "$ROOT/.autorelabel"
-  [[ "$output" == *"takes minutes"* ]]
-}
 
 @test "rhel relabel is a no-op when the image has no SELinux policy" {
   rhel_setup
@@ -409,4 +393,280 @@ bls_setup() {
 
   [ "$status" -eq 0 ]
   [[ "$output" == *"No BLS entries to check"* ]]
+}
+
+# --- CentOS 7 specifics ------------------------------------------------------
+
+# mirrorlist.centos.org no longer resolves, so the stock repos are dead and the
+# build cannot install anything until they are pointed at the vault. Verified
+# against the real vault earlier: yum -y update reaches "Complete!" with these.
+@test "centos 7 repositories are rewritten to the vault" {
+  rhel_setup
+  export ROOT="$BATS_TEST_TMPDIR/root"
+  export SOURCES_FILE=/etc/yum.repos.d/CentOS-Base.repo
+  mkdir -p "$ROOT/etc/yum.repos.d"
+  printf '[base]\nmirrorlist=http://mirrorlist.centos.org/?release=7&repo=os\nenabled=1\n' \
+    > "$ROOT/etc/yum.repos.d/CentOS-Base.repo"
+
+  family_configure_sources
+
+  local v="$ROOT/etc/yum.repos.d/99-pve-vault.repo"
+  [ -f "$v" ]
+  grep -q 'baseurl=http://vault.centos.org/7.9.2009/os/\$basearch/' "$v"
+  grep -q 'baseurl=http://vault.centos.org/7.9.2009/updates/\$basearch/' "$v"
+  grep -q 'baseurl=http://vault.centos.org/7.9.2009/extras/\$basearch/' "$v"
+  # the dead mirrorlist-backed repos must be off, or yum still tries them
+  grep -q '^enabled=0' "$ROOT/etc/yum.repos.d/CentOS-Base.repo"
+  ! grep -q '^mirrorlist=http' "$ROOT/etc/yum.repos.d/CentOS-Base.repo"
+}
+
+# Rocky's repos are live and must NOT be touched.
+@test "rocky repositories are left alone" {
+  rhel_setup
+  export SOURCES_FILE=/etc/yum.repos.d/rocky.repo
+  mkdir -p "$ROOT/etc/yum.repos.d"
+  printf '[baseos]\nmirrorlist=https://mirrors.rockylinux.org/mirrorlist\nenabled=1\n' \
+    > "$ROOT/etc/yum.repos.d/rocky.repo"
+
+  family_configure_sources
+
+  [ ! -f "$ROOT/etc/yum.repos.d/99-pve-vault.repo" ]
+  grep -q '^enabled=1' "$ROOT/etc/yum.repos.d/rocky.repo"
+}
+
+@test "an end-of-life notice is written for centos 7" {
+  rhel_setup
+  export SOURCES_FILE=/etc/yum.repos.d/CentOS-Base.repo
+
+  family_eol_notice
+
+  local n="$ROOT/etc/motd.d/98-pve-eol"
+  [ -f "$n" ]
+  grep -q '2024-06-30' "$n"
+  grep -q 'never receive another security update' "$n"
+}
+
+@test "no end-of-life notice for rocky" {
+  rhel_setup
+  export SOURCES_FILE=/etc/yum.repos.d/rocky.repo
+
+  family_eol_notice
+
+  [ ! -f "$ROOT/etc/motd.d/98-pve-eol" ]
+}
+
+# CentOS 7's pam_motd predates motd.d, so a notice only in motd.d would never be
+# shown. Every notice must be mirrored into /etc/motd in that case.
+@test "all motd.d notices are mirrored into /etc/motd when motd.d is unsupported" {
+  rhel_setup
+  export SOURCES_FILE=/etc/yum.repos.d/CentOS-Base.repo
+  mkdir -p "$ROOT/etc/cloud" "$ROOT/etc/sysctl.d"
+  printf 'disable_root: 1\n' > "$ROOT/etc/cloud/cloud.cfg"
+  printf 'PermitRootLogin yes\n' > "$ROOT/etc/ssh/sshd_config"
+  # no motd.d reference in pam => the fallback path
+  mkdir -p "$ROOT/etc/pam.d"
+  printf 'session optional pam_motd.so motd=/run/motd.dynamic\n' > "$ROOT/etc/pam.d/sshd"
+  export SYSCTL_FILE="$BATS_TEST_DIRNAME/fixtures/sysctl.conf"
+
+  configure_system
+
+  grep -q 'CentOS 7 reached end of life' "$ROOT/etc/motd"
+  grep -q 'password-based root SSH login' "$ROOT/etc/motd"
+}
+
+# Every family must implement the hooks the shared script calls.
+@test "both families implement family_eol_notice" {
+  for fam in debian rhel; do
+    FAMILY="$fam"
+    FAMILY_DIR="$BATS_TEST_DIRNAME/../scripts/family"
+    load_family
+    [ "$(type -t family_eol_notice)" = "function" ] || { echo "$fam lacks it"; return 1; }
+  done
+}
+
+# --- grub platform must match the image's firmware --------------------------
+
+# Measured failure: a BIOS-only CentOS 7 image was built with `grub2-mkconfig`,
+# which detected the *runner's* platform and emitted linuxefi/initrdefi. BIOS GRUB
+# cannot run those, so the image failed to boot with
+#   error: can't find command `linuxefi'
+# while the stock upstream image correctly used linux16/initrd16.
+grub_setup() {
+  rhel_setup
+  mkdir -p "$ROOT/boot/grub2"
+  # grub2-mkconfig is not available in the test environment; it leaves the file as
+  # the "already generated" one, which is what the rewrite step then fixes.
+  grub2-mkconfig() { :; }
+}
+
+@test "EFI-only commands are rewritten for a BIOS image" {
+  grub_setup
+  export FIRMWARE=bios
+  printf 'linuxefi /vmlinuz-x\ninitrdefi /initramfs-x.img\n' > "$ROOT/boot/grub2/grub.cfg"
+
+  run grub2_mkconfig_for_firmware
+
+  [ "$status" -eq 0 ]
+  grep -q '^linux16 /vmlinuz-x' "$ROOT/boot/grub2/grub.cfg"
+  grep -q '^initrd16 /initramfs-x.img' "$ROOT/boot/grub2/grub.cfg"
+  ! grep -q 'linuxefi\|initrdefi' "$ROOT/boot/grub2/grub.cfg"
+}
+
+@test "a BIOS image with no EFI-only commands is left alone" {
+  grub_setup
+  export FIRMWARE=bios
+  printf 'linux16 /vmlinuz-x\ninitrd16 /initramfs-x.img\n' > "$ROOT/boot/grub2/grub.cfg"
+
+  run grub2_mkconfig_for_firmware
+
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"Rewrote EFI-only"* ]]
+  grep -q '^linux16 ' "$ROOT/boot/grub2/grub.cfg"
+}
+
+@test "a UEFI image keeps its EFI commands" {
+  grub_setup
+  export FIRMWARE=efi
+  printf 'linuxefi /vmlinuz-x\ninitrdefi /initramfs-x.img\n' > "$ROOT/boot/grub2/grub.cfg"
+
+  run grub2_mkconfig_for_firmware
+
+  [ "$status" -eq 0 ]
+  grep -q 'linuxefi' "$ROOT/boot/grub2/grub.cfg"
+  ! grep -q 'linux16' "$ROOT/boot/grub2/grub.cfg"
+}
+
+# The guard that stops a non-booting image shipping, the way the PARTUUID one did.
+@test "a BIOS image still holding EFI commands is rejected" {
+  grub_setup
+  export FIRMWARE=bios
+  printf 'linuxefi /vmlinuz-x\n' > "$ROOT/boot/grub2/grub.cfg"
+  # make the rewrite a no-op so the guard is what fails the function
+  sed() { command sed "$@"; }
+  run bash -c '
+    source "'"$BATS_TEST_DIRNAME"'/../scripts/family/rhel.sh"
+    root_path(){ printf "%s%s\n" "$ROOT" "$1"; }
+    grub2-mkconfig(){ :; }
+    sed(){ :; }
+    grub2_mkconfig_for_firmware'
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"EFI-only commands on a BIOS image"* ]]
+}
+
+# --- SELinux must not prevent the first boot ---------------------------------
+
+# Measured on Rocky 10: with unlabeled files and SELinux enforcing, systemd 257
+# refuses to start at all --
+#   systemd[1]: Failed to allocate manager object: Permission denied
+# -- and the image hangs with no login prompt. Rocky 9's older systemd tolerated
+# it, so this only surfaced when 10 was added. Build-time relabelling is
+# impossible on the runner (security.selinux writes return EPERM even as root
+# with all capabilities), so the image relabels on first boot and must therefore
+# be permissive during that boot.
+selinux_setup() {
+  rhel_setup
+  mkdir -p "$ROOT/etc/selinux/targeted/contexts/files" "$ROOT/etc/selinux"
+  : > "$ROOT/etc/selinux/targeted/contexts/files/file_contexts"
+  printf 'SELINUX=enforcing\nSELINUXTYPE=targeted\n' > "$ROOT/etc/selinux/config"
+}
+
+@test "an enforcing image is made permissive with a first-boot relabel" {
+  selinux_setup
+  export SOURCES_FILE=/etc/yum.repos.d/rocky.repo
+
+  run family_relabel
+
+  [ "$status" -eq 0 ]
+  grep -q '^SELINUX=permissive' "$ROOT/etc/selinux/config"
+  [ -f "$ROOT/.autorelabel" ]
+  grep -q '^-F$' "$ROOT/.autorelabel"
+}
+
+# The delivered VM must end up enforcing again, or the security posture is
+# silently downgraded for the image's whole life.
+@test "a unit restores enforcing after the relabel" {
+  selinux_setup
+  export SOURCES_FILE=/etc/yum.repos.d/rocky.repo
+
+  family_relabel
+
+  local u="$ROOT/etc/systemd/system/99-pve-restore-selinux.service"
+  [ -f "$u" ]
+  grep -q 'SELINUX=enforcing' "$u"
+  grep -q 'rm -f /.autorelabel' "$u"
+  [ -L "$ROOT/etc/systemd/system/multi-user.target.wants/99-pve-restore-selinux.service" ]
+}
+
+@test "a non-enforcing image only gets the relabel marker" {
+  selinux_setup
+  export SOURCES_FILE=/etc/yum.repos.d/rocky.repo
+  printf 'SELINUX=disabled\n' > "$ROOT/etc/selinux/config"
+
+  run family_relabel
+
+  [ "$status" -eq 0 ]
+  grep -q '^SELINUX=disabled' "$ROOT/etc/selinux/config"
+  [ -f "$ROOT/.autorelabel" ]
+  [[ "$output" == *"not enforcing"* ]]
+}
+
+@test "an image with no SELinux policy is left alone" {
+  rhel_setup
+  export SOURCES_FILE=/etc/yum.repos.d/rocky.repo
+
+  run family_relabel
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"no SELinux file_contexts"* ]]
+  [ ! -f "$ROOT/.autorelabel" ]
+}
+
+# --- login notices must actually be displayed --------------------------------
+
+# RHEL-family images never call pam_motd: /etc/pam.d/sshd and /etc/pam.d/login
+# carry no motd line, so a notice in /etc/motd or /etc/motd.d is never shown. For
+# CentOS 7 that defeats the point of the end-of-life warning.
+@test "rhel adds the missing pam_motd line" {
+  rhel_setup
+  mkdir -p "$ROOT/etc/pam.d"
+  printf 'session    required     pam_loginuid.so\nsession    include      password-auth\n' \
+    > "$ROOT/etc/pam.d/sshd"
+  printf 'session    required     pam_selinux.so open\n' > "$ROOT/etc/pam.d/login"
+
+  run family_enable_motd
+
+  [ "$status" -eq 0 ]
+  grep -q 'pam_motd.so' "$ROOT/etc/pam.d/sshd"
+  grep -q 'pam_motd.so' "$ROOT/etc/pam.d/login"
+  [[ "$output" == *"2 pam config(s)"* ]]
+}
+
+@test "an existing pam_motd line is not duplicated" {
+  rhel_setup
+  mkdir -p "$ROOT/etc/pam.d"
+  printf 'session    optional     pam_motd.so motd=/run/motd.dynamic\n' > "$ROOT/etc/pam.d/sshd"
+  printf 'session    required     pam_loginuid.so\n' > "$ROOT/etc/pam.d/login"
+
+  run family_enable_motd
+
+  [ "$status" -eq 0 ]
+  [ "$(grep -c 'pam_motd' "$ROOT/etc/pam.d/sshd")" -eq 1 ]
+  grep -q 'pam_motd' "$ROOT/etc/pam.d/login"
+}
+
+@test "rhel tolerates missing pam files" {
+  rhel_setup
+
+  run family_enable_motd
+
+  [ "$status" -eq 0 ]
+}
+
+@test "both families implement family_enable_motd" {
+  for fam in debian rhel; do
+    FAMILY="$fam"
+    FAMILY_DIR="$BATS_TEST_DIRNAME/../scripts/family"
+    load_family
+    [ "$(type -t family_enable_motd)" = "function" ] || { echo "$fam lacks it"; return 1; }
+  done
 }

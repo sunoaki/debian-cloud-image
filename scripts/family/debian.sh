@@ -63,3 +63,15 @@ family_relabel() {
 family_default_user_alias() {
   printf 'ubuntu\n'
 }
+
+# No end-of-life notices for this family: every entry it serves is a supported
+# release. Present as an explicit no-op so the hook contract is uniform and
+# customize-rootfs.sh can call it unconditionally.
+family_eol_notice() {
+  return 0
+}
+
+# Debian and Ubuntu already call pam_motd, so the shared motd work suffices.
+family_enable_motd() {
+  return 0
+}
