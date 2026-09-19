@@ -261,10 +261,15 @@ jobs:
           # reasons unrelated to the image being broken.
           if [ "${FIRMWARE:-bios}" = "efi" ]; then
             firmware=uefi
+            # OVMF's variable store must be writable (the firmware persists NVRAM
+            # there) and the packaged file is root-only, which made qemu fail with
+            # "Could not open .../OVMF_VARS_4M.fd: Permission denied". Copy it to a
+            # path this user owns.
+            cp /usr/share/OVMF/OVMF_VARS_4M.fd "$PWD/ovmf-vars.fd"
             # split across lines; shellcheck SC2054 objects to the comma inside
             # the array element `if=pflash,format=raw,...`
             fw_args=(-drive "if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd"
-                     -drive "if=pflash,format=raw,file=/usr/share/OVMF/OVMF_VARS_4M.fd")
+                     -drive "if=pflash,format=raw,file=$PWD/ovmf-vars.fd")
           else
             firmware=bios
             fw_args=()
