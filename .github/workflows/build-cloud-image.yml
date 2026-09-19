@@ -91,7 +91,9 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-utils cloud-guest-utils wget
+          # xfsprogs provides xfs_growfs, which the XFS roots (Rocky, CentOS)
+          # need; e2fsprogs (resize2fs) is already present on the runner image.
+          sudo apt-get install -y qemu-utils cloud-guest-utils wget xfsprogs
 
       # Split in two so the ~600 MB image can be cached on its *checksum*: the
       # checksum has to be fetched before a stable cache key exists, and a hit
@@ -210,6 +212,12 @@ jobs:
         run: |
           sudo qemu-img convert -O qcow2 -c "$SRC_IMAGE" "$RELEASE_NAME"
           rm -f "$SRC_IMAGE"
+          # qemu-img ran as root, so the output is root-owned. The boot test runs
+          # as the unprivileged runner user and could never open it: it failed
+          # with "Could not open ...: Permission denied" and reported only "did not
+          # reach a login prompt", which is why the boot test never passed on any
+          # distro. Hand ownership back to the build user.
+          sudo chown "$(id -u):$(id -g)" "$RELEASE_NAME"
           echo "IMAGE_NAME=$RELEASE_NAME" >> "$GITHUB_ENV"
 
       - name: Upload artifact
@@ -226,9 +234,17 @@ jobs:
       # (GitHub documents nested VMs as unsupported), so this falls back to TCG
       # and, because TCG is ~10-50x slower, it is advisory: a failure here is
       # reported but does not fail the build. The hard content assertions live in
-      # scripts/customize-image.sh. Enable with a repo variable BOOT_TEST=true.
+      # scripts/customize-image.sh.
+      #
+      # On by default for the rhel family, off for debian. The RHEL family is
+      # where a wrong result is hardest to catch by reading files: SELinux labels,
+      # grub2 and the separate XBOOTLDR /boot can all fail at boot while every
+      # file-based assertion passes. Debian/Ubuntu have shipped through this path
+      # for longer, and their builds are the common case for the schedule, so they
+      # stay opt-in to avoid adding minutes to every run. BOOT_TEST=true forces it
+      # on everywhere; BOOT_TEST=false forces it off.
       - name: Boot test (advisory, TCG)
-        if: ${{ vars.BOOT_TEST == 'true' }}
+        if: ${{ (matrix.family == 'rhel' && vars.BOOT_TEST != 'false') || vars.BOOT_TEST == 'true' }}
         continue-on-error: true
         env:
           IMAGE: ${{ env.IMAGE_NAME }}
@@ -237,6 +253,11 @@ jobs:
           sudo apt-get install -y qemu-system-x86 ovmf
           accel=tcg
           [ -r /dev/kvm ] && accel=kvm
+          # -cpu max: the RHEL family's glibc is built for x86-64-v2 and aborts
+          # with "Fatal glibc error: CPU does not ..." under qemu's default CPU
+          # model, which panics init and looks like an unbootable image. Measured
+          # on a stock Rocky 9 image: default model -> kernel panic, -cpu max ->
+          # login prompt.
 
           # Firmware is chosen from the partition type GUIDs that
           # scripts/customize-image.sh read while the disk was attached, because
@@ -245,10 +266,15 @@ jobs:
           # reasons unrelated to the image being broken.
           if [ "${FIRMWARE:-bios}" = "efi" ]; then
             firmware=uefi
+            # OVMF's variable store must be writable (the firmware persists NVRAM
+            # there) and the packaged file is root-only, which made qemu fail with
+            # "Could not open .../OVMF_VARS_4M.fd: Permission denied". Copy it to a
+            # path this user owns.
+            cp /usr/share/OVMF/OVMF_VARS_4M.fd "$PWD/ovmf-vars.fd"
             # split across lines; shellcheck SC2054 objects to the comma inside
             # the array element `if=pflash,format=raw,...`
             fw_args=(-drive "if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd"
-                     -drive "if=pflash,format=raw,file=/usr/share/OVMF/OVMF_VARS_4M.fd")
+                     -drive "if=pflash,format=raw,file=$PWD/ovmf-vars.fd")
           else
             firmware=bios
             fw_args=()
@@ -262,12 +288,16 @@ jobs:
           # a hang guard with ~4x headroom over the measured baseline: a noble
           # image reached the login prompt in 150s wall clock on a 2-vCPU TCG run
           # (the guest clock reported 15.6s), and runner speed varies.
-          rm -f console.log
+          rm -f console.log qemu.log
+          # Keep qemu's own stderr: it goes nowhere useful otherwise. A previous
+          # version redirected it to /dev/null, so when the requested accelerator
+          # was unusable the only symptom was "did not reach a login prompt in 2s"
+          # with no console.log -- which says nothing about the actual cause.
           qemu-system-x86_64 \
-            -machine q35,accel="$accel" -m 2048 -smp 2 -nographic \
+            -machine q35,accel="$accel" -cpu max -m 2048 -smp 2 -nographic \
             "${fw_args[@]}" \
             -drive file="$IMAGE",if=virtio,format=qcow2 \
-            -serial "file:console.log" >/dev/null 2>&1 &
+            -serial "file:console.log" >qemu.log 2>&1 &
           qpid=$!
           reached=""
           while [ $((SECONDS - started)) -lt 600 ]; do
@@ -285,8 +315,42 @@ jobs:
           elapsed=$((SECONDS - started))
           kill -9 "$qpid" 2>/dev/null || true
           wait "$qpid" 2>/dev/null || true
+
+          if [ -z "$reached" ] && ! [ -s console.log ]; then
+            # qemu never even started. Report why instead of blaming the image.
+            echo "qemu produced no guest console output, so it failed to start."
+            echo "--- qemu output ---"
+            tail -n 30 qemu.log || true
+            echo "::warning title=Boot test::qemu failed to start on $accel after ${elapsed}s (see qemu output above)"
+            # A dead qemu says nothing about the image. Retry once in software
+            # emulation so a missing/unusable KVM only costs time, not signal.
+            if [ "$accel" = "kvm" ]; then
+              echo "Retrying with -accel tcg"
+              rm -f console.log
+              qemu-system-x86_64 \
+                -machine q35,accel=tcg -cpu max -m 2048 -smp 2 -nographic \
+                "${fw_args[@]}" \
+                -drive file="$IMAGE",if=virtio,format=qcow2 \
+                -serial "file:console.log" >qemu.log 2>&1 &
+              qpid=$!
+              reached=""
+              while [ $((SECONDS - started)) -lt 600 ]; do
+                if grep -aqE 'login: ' console.log 2>/dev/null; then
+                  reached=yes
+                  break
+                fi
+                kill -0 "$qpid" 2>/dev/null || break
+                sleep 2
+              done
+              elapsed=$((SECONDS - started))
+              kill -9 "$qpid" 2>/dev/null || true
+              wait "$qpid" 2>/dev/null || true
+              accel=tcg
+            fi
+          fi
+
           echo "--- last console output (${elapsed}s, ${firmware}/${accel}) ---"
-          tail -n 40 console.log || true
+          tail -n 40 console.log 2>/dev/null || echo "(console.log is empty)"
           [ -n "$reached" ] || {
             echo "::warning title=Boot test::console did not reach a login prompt within ${elapsed}s ($firmware/$accel)"
             exit 1

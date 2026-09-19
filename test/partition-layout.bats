@@ -246,3 +246,47 @@ SHA256 (Rocky-9-GenericCloud-Base.latest.x86_64.qcow2) = 92c206cc6f790c61583247e
   local sums='# Rock.qcow2: 645988352 bytes'
   [ -z "$(layout_checksum_for "$sums" Rock.qcow2)" ]
 }
+
+# --- initrd naming across families ------------------------------------------
+
+# The boot-chain assertion counts initrds to detect a regression. Debian and
+# Ubuntu name them initrd.img-<ver>; the RHEL family names them
+# initramfs-<ver>.img. Counting only the Debian spelling made the baseline 0 on
+# Rocky, which the first real Rocky build log showed as "0 initrd(s)" -- a
+# baseline of zero makes the regression check unable to detect anything.
+@test "a RHEL-style /boot initramfs is counted" {
+  local dir="$BATS_TEST_TMPDIR/boot"
+  mkdir -p "$dir"
+  : > "$dir/vmlinuz-5.14.0-687.el9"
+  : > "$dir/initramfs-5.14.0-687.el9.img"
+  : > "$dir/initramfs-0-rescue-abcd.img"
+
+  local n
+  n=$(compgen -G "$dir/initrd.img-*" | wc -l || true)
+  n=$((n + $(compgen -G "$dir/initramfs-*.img" | wc -l || true)))
+  [ "$n" -eq 2 ]
+}
+
+@test "a Debian-style /boot initrd is counted" {
+  local dir="$BATS_TEST_TMPDIR/boot"
+  mkdir -p "$dir"
+  : > "$dir/vmlinuz-6.12.107"
+  : > "$dir/initrd.img-6.12.107"
+
+  local n
+  n=$(compgen -G "$dir/initrd.img-*" | wc -l || true)
+  n=$((n + $(compgen -G "$dir/initramfs-*.img" | wc -l || true)))
+  [ "$n" -eq 1 ]
+}
+
+# A Rocky /boot carries a rescue kernel as well as the main one, so the baseline
+# is 2, not 1. Counting both is what makes the "did a kernel appear" check
+# meaningful there.
+@test "a rescue kernel plus a main kernel counts two" {
+  local dir="$BATS_TEST_TMPDIR/boot"
+  mkdir -p "$dir"
+  : > "$dir/vmlinuz-5.14.0-687.el9"
+  : > "$dir/vmlinuz-0-rescue-abcd"
+
+  [ "$(compgen -G "$dir/vmlinuz-*" | wc -l)" -eq 2 ]
+}

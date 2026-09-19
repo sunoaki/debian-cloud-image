@@ -205,6 +205,12 @@ if [ -n "$BOOTDEV" ]; then
 fi
 
 if [ "$GROW_RECIPE" = "mounted" ]; then
+  command -v xfs_growfs >/dev/null 2>&1 || {
+    echo "Root is ${ROOT_FS} but xfs_growfs is not installed on this runner;" >&2
+    echo "install xfsprogs, or the resize silently does nothing and the chroot" >&2
+    echo "install later fails with ENOSPC." >&2
+    exit 1
+  }
   case "$ROOT_FS" in
   xfs) xfs_growfs "$MNT" >/dev/null ;;
   esac
@@ -220,7 +226,11 @@ AVAIL_KB=$(df -Pk "$MNT" | awk 'NR==2 {print $4}')
 
 # Baseline for the post-chroot boot-chain assertion below (see assert_boot_chain).
 BASE_KERNELS=$(compgen -G "$MNT/boot/vmlinuz-*" | wc -l || true)
+# initrd naming differs by family: Debian/Ubuntu use initrd.img-<ver>, the RHEL
+# family uses initramfs-<ver>.img. Counting only the Debian spelling made the
+# baseline 0 on Rocky, which would have made the regression check meaningless.
 BASE_INITRDS=$(compgen -G "$MNT/boot/initrd.img-*" | wc -l || true)
+BASE_INITRDS=$((BASE_INITRDS + $(compgen -G "$MNT/boot/initramfs-*.img" | wc -l || true)))
 BASE_BOOT_SEPARATE=false
 [ -n "$BOOTDEV" ] && BASE_BOOT_SEPARATE=true
 echo "Boot chain before customization: $BASE_KERNELS kernel(s), $BASE_INITRDS initrd(s), separate /boot: $BASE_BOOT_SEPARATE"
@@ -232,14 +242,27 @@ mount --bind /proc "$MNT/proc"
 mount --bind /sys "$MNT/sys"
 
 # DNS inside the chroot; restore the original file afterwards.
-RESOLV_BACKUP=/tmp/resolv.conf.orig
-cp -a "$MNT/etc/resolv.conf" "$RESOLV_BACKUP"
+#
+# Rocky ships /etc/resolv.conf as a symlink into a path that only exists once
+# NetworkManager or systemd-resolved has run, so the target is usually absent.
+# `cp -a` on such a link aborts the build ("cannot stat"), so only back up a real
+# regular file and otherwise just replace the link. cleanup() restores the backup
+# only when it exists, and re-creating a symlink is not worth the complexity: the
+# image's own cloud-init/NetworkManager rewrites this file on first boot anyway.
+RESOLV_BACKUP=
+if [ -f "$MNT/etc/resolv.conf" ] && [ ! -L "$MNT/etc/resolv.conf" ]; then
+  RESOLV_BACKUP=/tmp/resolv.conf.orig
+  cp -a "$MNT/etc/resolv.conf" "$RESOLV_BACKUP"
+fi
 rm -f "$MNT/etc/resolv.conf"
 echo "nameserver 1.1.1.1" > "$MNT/etc/resolv.conf"
 
-# Seed apt's download cache from a previous run (if any).
-if [ -d "$REPO_ROOT/.apt-cache" ] && ls "$REPO_ROOT/.apt-cache"/*.deb >/dev/null 2>&1; then
-  cp -n "$REPO_ROOT/.apt-cache"/*.deb "$MNT/var/cache/apt/archives/" || true
+# Seed apt's download cache from a previous run (if any). Debian family only:
+# the RHEL family has no apt archives directory to seed.
+if [ "${FAMILY:-debian}" = "debian" ] &&
+  compgen -G "$REPO_ROOT/.apt-cache/*.deb" >/dev/null; then
+  mkdir -p "$MNT/var/cache/apt/archives"
+  cp -n "$REPO_ROOT/.apt-cache/"*.deb "$MNT/var/cache/apt/archives/" || true
 fi
 
 # Stage the rootfs customization script, package list and sysctl template
@@ -271,7 +294,11 @@ kernel_count() {
   compgen -G "$MNT/boot/vmlinuz-*" | wc -l || true
 }
 initrd_count() {
-  compgen -G "$MNT/boot/initrd.img-*" | wc -l || true
+  # Both spellings: Debian/Ubuntu initrd.img-<ver>, RHEL initramfs-<ver>.img.
+  local n
+  n=$(compgen -G "$MNT/boot/initrd.img-*" | wc -l || true)
+  n=$((n + $(compgen -G "$MNT/boot/initramfs-*.img" | wc -l || true)))
+  printf '%s\n' "$n"
 }
 assert_boot_chain() {
   local now_k now_i problem
@@ -293,11 +320,23 @@ assert_boot_chain() {
 assert_boot_chain
 
 # Export downloaded .debs for the cache, then scrub apt state from the image.
-mkdir -p "$REPO_ROOT/.apt-cache"
-cp -n "$MNT/var/cache/apt/archives/"*.deb "$REPO_ROOT/.apt-cache/" || true
-rm -rf "$MNT/var/lib/apt/lists" "$MNT/var/cache/apt/archives" "$MNT/var/cache/apt/partial"
+# apt-specific, so only for the debian family: an unmatched *.deb glob aborts
+# under `set -e` even with `|| true`, which is how a Rocky build died here after
+# its whole chroot stage had already succeeded.
+if [ "${FAMILY:-debian}" = "debian" ]; then
+  mkdir -p "$REPO_ROOT/.apt-cache"
+  if compgen -G "$MNT/var/cache/apt/archives/*.deb" >/dev/null; then
+    cp -n "$MNT/var/cache/apt/archives/"*.deb "$REPO_ROOT/.apt-cache/" || true
+  fi
+  rm -rf "$MNT/var/lib/apt/lists" "$MNT/var/cache/apt/archives" "$MNT/var/cache/apt/partial"
+fi
 
-# Restore resolv.conf; cleanup() handles umounts + detach on exit.
-cp -a "$RESOLV_BACKUP" "$MNT/etc/resolv.conf"
+# Restore resolv.conf when there was a real file to preserve; cleanup() handles
+# umounts + detach on exit. A symlink original leaves RESOLV_BACKUP empty, so
+# guard the same way cleanup() does: `cp -a ""` would abort the build at the very
+# last step, after the chroot work had already succeeded.
+if [ -n "$RESOLV_BACKUP" ] && [ -f "$RESOLV_BACKUP" ]; then
+  cp -a "$RESOLV_BACKUP" "$MNT/etc/resolv.conf"
+fi
 RESOLV_BACKUP=
 echo "customize-image.sh done"

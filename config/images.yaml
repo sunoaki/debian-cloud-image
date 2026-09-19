@@ -84,3 +84,17 @@ images:
     family: debian
     packages_file: config/packages-deb.txt
     sysctl_file: config/sysctl-debian.conf
+
+  - distro: rocky
+    codename: blue-onyx
+    major: "9"
+    base_url: https://dl.rockylinux.org/pub/rocky/9/images/x86_64
+    image_name: Rocky-9-GenericCloud-Base.latest.x86_64.qcow2
+    sha_file: Rocky-9-GenericCloud-Base.latest.x86_64.qcow2.CHECKSUM
+    hash_cmd: sha256sum
+    sources_file: /etc/yum.repos.d/rocky.repo
+    cloud_cfg: /etc/cloud/cloud.cfg
+    sources_format: rpm
+    family: rhel
+    packages_file: config/packages-rpm.txt
+    sysctl_file: config/sysctl-rhel.conf
