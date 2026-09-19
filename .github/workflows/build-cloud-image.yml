@@ -272,12 +272,16 @@ jobs:
           # a hang guard with ~4x headroom over the measured baseline: a noble
           # image reached the login prompt in 150s wall clock on a 2-vCPU TCG run
           # (the guest clock reported 15.6s), and runner speed varies.
-          rm -f console.log
+          rm -f console.log qemu.log
+          # Keep qemu's own stderr: it goes nowhere useful otherwise. A previous
+          # version redirected it to /dev/null, so when the requested accelerator
+          # was unusable the only symptom was "did not reach a login prompt in 2s"
+          # with no console.log -- which says nothing about the actual cause.
           qemu-system-x86_64 \
             -machine q35,accel="$accel" -m 2048 -smp 2 -nographic \
             "${fw_args[@]}" \
             -drive file="$IMAGE",if=virtio,format=qcow2 \
-            -serial "file:console.log" >/dev/null 2>&1 &
+            -serial "file:console.log" >qemu.log 2>&1 &
           qpid=$!
           reached=""
           while [ $((SECONDS - started)) -lt 600 ]; do
@@ -295,8 +299,42 @@ jobs:
           elapsed=$((SECONDS - started))
           kill -9 "$qpid" 2>/dev/null || true
           wait "$qpid" 2>/dev/null || true
+
+          if [ -z "$reached" ] && ! [ -s console.log ]; then
+            # qemu never even started. Report why instead of blaming the image.
+            echo "qemu produced no guest console output, so it failed to start."
+            echo "--- qemu output ---"
+            tail -n 30 qemu.log || true
+            echo "::warning title=Boot test::qemu failed to start on $accel after ${elapsed}s (see qemu output above)"
+            # A dead qemu says nothing about the image. Retry once in software
+            # emulation so a missing/unusable KVM only costs time, not signal.
+            if [ "$accel" = "kvm" ]; then
+              echo "Retrying with -accel tcg"
+              rm -f console.log
+              qemu-system-x86_64 \
+                -machine q35,accel=tcg -m 2048 -smp 2 -nographic \
+                "${fw_args[@]}" \
+                -drive file="$IMAGE",if=virtio,format=qcow2 \
+                -serial "file:console.log" >qemu.log 2>&1 &
+              qpid=$!
+              reached=""
+              while [ $((SECONDS - started)) -lt 600 ]; do
+                if grep -aqE 'login: ' console.log 2>/dev/null; then
+                  reached=yes
+                  break
+                fi
+                kill -0 "$qpid" 2>/dev/null || break
+                sleep 2
+              done
+              elapsed=$((SECONDS - started))
+              kill -9 "$qpid" 2>/dev/null || true
+              wait "$qpid" 2>/dev/null || true
+              accel=tcg
+            fi
+          fi
+
           echo "--- last console output (${elapsed}s, ${firmware}/${accel}) ---"
-          tail -n 40 console.log || true
+          tail -n 40 console.log 2>/dev/null || echo "(console.log is empty)"
           [ -n "$reached" ] || {
             echo "::warning title=Boot test::console did not reach a login prompt within ${elapsed}s ($firmware/$accel)"
             exit 1
