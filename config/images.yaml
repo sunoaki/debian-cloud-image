@@ -1,11 +1,13 @@
 # Cloud image build matrix - one entry per distro release.
-# Consumed by the `generate-matrix` job in build-cloud-images.yml.
+# Consumed by the `generate-matrix` job in build-cloud-image.yml.
 # Add a new distro by appending an entry here (and a PVE template VMID in
 # update-cloud-templates.sh on the PVE side).
 #
 # sources_format:
 #   deb822 = /etc/apt/sources.list.d/*.sources (Debian 12+ / Ubuntu 24.04+)
 #   legacy = /etc/apt/sources.list single-line deb format (Ubuntu 22.04)
+#   rpm    = /etc/yum.repos.d/*.repo; the rhel family ignores this field and
+#            always rewrites the .repo files itself
 #
 # family: selects scripts/family/<family>.sh, which supplies the hooks that
 #   differ between distro families (package manager, source layout, bootloader
