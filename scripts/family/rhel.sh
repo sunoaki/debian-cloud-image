@@ -162,7 +162,48 @@ family_update_bootloader() {
     return 1
   fi
 
-  grub2-mkconfig -o /boot/grub2/grub.cfg
+  grub2_mkconfig_for_firmware
+}
+
+# grub2-mkconfig decides which linux/initrd command to emit from the platform it
+# detects, and inside our chroot that is the runner's view rather than the
+# image's. Consequence, measured: a BIOS-only CentOS 7 image got a grub.cfg full
+# of `linuxefi`/`initrdefi`, which the BIOS GRUB cannot execute, so the image
+# failed to boot with "error: can't find command `linuxefi'". The stock upstream
+# image correctly uses linux16/initrd16.
+#
+# The firmware is already known from the partition table (no ESP => BIOS), so pin
+# the generation to it instead of letting the build host decide. For a BIOS image
+# that means asking for the i386-pc platform explicitly; for UEFI the default is
+# already right.
+grub2_mkconfig_for_firmware() {
+  if [ "${FIRMWARE:-}" = "bios" ]; then
+    if ! grub2-mkconfig -o "$(root_path /boot/grub2/grub.cfg)" 2>/dev/null; then
+      echo "grub2-mkconfig failed" >&2
+      return 1
+    fi
+    # Rewrite any EFI-only command names back to their BIOS equivalents. This is
+    # deliberately a textual correction rather than another mkconfig run: the
+    # command name is the only platform-specific part of these entries, and the
+    # alternative (trusting detection inside the chroot) is what broke.
+    local cfg fixed=0
+    cfg="$(root_path /boot/grub2/grub.cfg)"
+    if grep -q '\blinuxefi\b\|\binitrdefi\b' "$cfg"; then
+      sed -i 's/\blinuxefi\b/linux16/g; s/\binitrdefi\b/initrd16/g' "$cfg"
+      fixed=1
+    fi
+    if [ "$fixed" -eq 1 ]; then
+      echo "Rewrote EFI-only linuxefi/initrdefi to linux16/initrd16 for a BIOS image"
+    fi
+    # Prove the result: a BIOS image must not carry EFI-only commands.
+    if grep -q '\blinuxefi\b\|\binitrdefi\b' "$cfg"; then
+      echo "grub.cfg still contains EFI-only commands on a BIOS image;" >&2
+      echo "the image would fail to boot with \"can't find command \`linuxefi'\"." >&2
+      return 1
+    fi
+  else
+    grub2-mkconfig -o "$(root_path /boot/grub2/grub.cfg)"
+  fi
 }
 
 # The unit is sshd, not ssh. The motd text tells the operator to reload it.
@@ -183,35 +224,73 @@ family_configure_ntp() {
 }
 
 # RHEL family defaults SELinux to enforcing, and files written from this chroot
-# (sed -i, printf >, install) carry no security.selinux xattr. An unlabeled file
-# is denied by type enforcement.
+# (sed -i, printf >, install) carry no security.selinux xattr. That is not
+# cosmetic: systemd 257 in Rocky 10 refuses to start at all when it cannot set
+# contexts and raise RLIMIT_NOFILE against unlabeled state:
+#   systemd[1]: Failed to allocate manager object: Permission denied
+# which it reported as a hang with no login prompt. Rocky 9's older systemd
+# tolerated the same unlabeled state, which is why this only appeared when 10
+# was added.
 #
-# Relabelling at build time is NOT possible on a GitHub-hosted runner, and this
-# was measured rather than assumed: writing a security.selinux xattr fails with
-# EPERM even as uid 0 in a privileged container with every capability
-# (CapEff=000001ffffffffff), while user.* on the same file succeeds. The cause is
-# the kernel/LSM: the runner's kernel has SELinux compiled in but not enabled, so
-# no handler claims the security.selinux name and setfiles would silently write
-# nothing -- reporting success over an image that ships unlabeled.
+# Relabelling at build time is not possible on a GitHub-hosted runner, measured
+# rather than assumed: writing a security.selinux xattr returns EPERM even as
+# uid 0 in a privileged container with every capability, while user.* on the same
+# file succeeds, because the runner kernel has SELinux compiled in but not
+# enabled and nothing claims that xattr name. setfiles would silently write
+# nothing while reporting success.
 #
-# So the relabel is deferred to first boot, which is also Red Hat's documented
-# mechanism: "Use the `fixfiles -F onboot` command as root to create the
+# So labels are fixed on first boot instead, which is Red Hat's documented
+# mechanism ("Use the `fixfiles -F onboot` command as root to create the
 # /.autorelabel file containing the -F option to ensure that files are relabeled
-# upon next reboot." (RHEL 9, Changing SELinux states and modes.)
-#
-# Costs, stated plainly because they are real: the first boot of a derived VM
-# relabels before the login prompt appears, which takes minutes, so the advisory
-# boot test for RHEL entries must not expect a prompt inside its normal budget.
+# upon next reboot", RHEL 9 Changing SELinux states and modes). For that first
+# boot to succeed while still unlabeled, SELinux must be permissive during it;
+# the relabel then runs, and enforcing is restored. Without this the image hangs
+# before any login prompt, which is exactly what happened.
 family_relabel() {
-  local ctx
+  local ctx selinux_cfg
   ctx="$(root_path /etc/selinux/targeted/contexts/files/file_contexts)"
+  selinux_cfg="$(root_path /etc/selinux/config)"
   [ -f "$ctx" ] || {
     echo "WARN: no SELinux file_contexts in the image; skipping relabel" >&2
     return 0
   }
+
   printf -- '-F\n' > "$(root_path /.autorelabel)"
-  echo "SELinux relabel deferred to first boot via /.autorelabel (-F)"
-  echo "NOTE: first boot relabels before the login prompt and takes minutes"
+
+  # Permissive for the first boot only. /usr/libexec/selinux-autorelabel (run by
+  # selinux-autorelabel.service) rewrites /etc/selinux/config back to enforcing
+  # after relabelling, so the delivered VM ends up enforcing with correct labels.
+  if [ -f "$selinux_cfg" ]; then
+    if grep -q '^SELINUX=enforcing' "$selinux_cfg"; then
+      sed -i 's/^SELINUX=enforcing/SELINUX=permissive/' "$selinux_cfg"
+      # Record the intent, and make the restore independent of whether
+      # selinux-autorelabel's own restore runs (it can be skipped if the relabel
+      # is interrupted). A oneshot unit is the least surprising place for it.
+      mkdir -p "$(root_path /etc/systemd/system)"
+      cat > "$(root_path /etc/systemd/system/99-pve-restore-selinux.service)" <<'UNIT'
+[Unit]
+Description=Restore enforcing SELinux after the first-boot relabel
+After=selinux-autorelabel.service
+ConditionPathExists=/etc/selinux/config
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'sed -i "s/^SELINUX=permissive/SELINUX=enforcing/" /etc/selinux/config'
+ExecStart=/usr/bin/rm -f /.autorelabel
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+      mkdir -p "$(root_path /etc/systemd/system/multi-user.target.wants)"
+      ln -sf ../99-pve-restore-selinux.service \
+        "$(root_path /etc/systemd/system/multi-user.target.wants/99-pve-restore-selinux.service)"
+      echo "SELinux: permissive for the first boot, relabelled via /.autorelabel, then enforcing"
+    else
+      echo "SELinux: image is not enforcing; only /.autorelabel was written"
+    fi
+  else
+    echo "WARN: no /etc/selinux/config; not touching SELinux state" >&2
+  fi
 }
 
 # PVE's cloud-init applies cipassword to the default user, which differs even

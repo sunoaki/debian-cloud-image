@@ -283,22 +283,6 @@ rhel_setup() {
   grep -q '^tcp_bbr$' "$ROOT/etc/modules-load.d/bbr.conf"
 }
 
-# Build-time relabel is impossible on the runner (measured: security.selinux
-# writes return EPERM even as uid 0 with all capabilities, because the kernel has
-# SELinux compiled in but not enabled). The image therefore carries
-# /.autorelabel and relabels on first boot instead.
-@test "rhel defers the SELinux relabel to first boot" {
-  rhel_setup
-  mkdir -p "$ROOT/etc/selinux/targeted/contexts/files"
-  : > "$ROOT/etc/selinux/targeted/contexts/files/file_contexts"
-
-  run family_relabel
-
-  [ "$status" -eq 0 ]
-  [ -f "$ROOT/.autorelabel" ]
-  grep -q '^-F$' "$ROOT/.autorelabel"
-  [[ "$output" == *"takes minutes"* ]]
-}
 
 @test "rhel relabel is a no-op when the image has no SELinux policy" {
   rhel_setup
@@ -498,4 +482,141 @@ bls_setup() {
     load_family
     [ "$(type -t family_eol_notice)" = "function" ] || { echo "$fam lacks it"; return 1; }
   done
+}
+
+# --- grub platform must match the image's firmware --------------------------
+
+# Measured failure: a BIOS-only CentOS 7 image was built with `grub2-mkconfig`,
+# which detected the *runner's* platform and emitted linuxefi/initrdefi. BIOS GRUB
+# cannot run those, so the image failed to boot with
+#   error: can't find command `linuxefi'
+# while the stock upstream image correctly used linux16/initrd16.
+grub_setup() {
+  rhel_setup
+  mkdir -p "$ROOT/boot/grub2"
+  # grub2-mkconfig is not available in the test environment; it leaves the file as
+  # the "already generated" one, which is what the rewrite step then fixes.
+  grub2-mkconfig() { :; }
+}
+
+@test "EFI-only commands are rewritten for a BIOS image" {
+  grub_setup
+  export FIRMWARE=bios
+  printf 'linuxefi /vmlinuz-x\ninitrdefi /initramfs-x.img\n' > "$ROOT/boot/grub2/grub.cfg"
+
+  run grub2_mkconfig_for_firmware
+
+  [ "$status" -eq 0 ]
+  grep -q '^linux16 /vmlinuz-x' "$ROOT/boot/grub2/grub.cfg"
+  grep -q '^initrd16 /initramfs-x.img' "$ROOT/boot/grub2/grub.cfg"
+  ! grep -q 'linuxefi\|initrdefi' "$ROOT/boot/grub2/grub.cfg"
+}
+
+@test "a BIOS image with no EFI-only commands is left alone" {
+  grub_setup
+  export FIRMWARE=bios
+  printf 'linux16 /vmlinuz-x\ninitrd16 /initramfs-x.img\n' > "$ROOT/boot/grub2/grub.cfg"
+
+  run grub2_mkconfig_for_firmware
+
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"Rewrote EFI-only"* ]]
+  grep -q '^linux16 ' "$ROOT/boot/grub2/grub.cfg"
+}
+
+@test "a UEFI image keeps its EFI commands" {
+  grub_setup
+  export FIRMWARE=efi
+  printf 'linuxefi /vmlinuz-x\ninitrdefi /initramfs-x.img\n' > "$ROOT/boot/grub2/grub.cfg"
+
+  run grub2_mkconfig_for_firmware
+
+  [ "$status" -eq 0 ]
+  grep -q 'linuxefi' "$ROOT/boot/grub2/grub.cfg"
+  ! grep -q 'linux16' "$ROOT/boot/grub2/grub.cfg"
+}
+
+# The guard that stops a non-booting image shipping, the way the PARTUUID one did.
+@test "a BIOS image still holding EFI commands is rejected" {
+  grub_setup
+  export FIRMWARE=bios
+  printf 'linuxefi /vmlinuz-x\n' > "$ROOT/boot/grub2/grub.cfg"
+  # make the rewrite a no-op so the guard is what fails the function
+  sed() { command sed "$@"; }
+  run bash -c '
+    source "'"$BATS_TEST_DIRNAME"'/../scripts/family/rhel.sh"
+    root_path(){ printf "%s%s\n" "$ROOT" "$1"; }
+    grub2-mkconfig(){ :; }
+    sed(){ :; }
+    grub2_mkconfig_for_firmware'
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"EFI-only commands on a BIOS image"* ]]
+}
+
+# --- SELinux must not prevent the first boot ---------------------------------
+
+# Measured on Rocky 10: with unlabeled files and SELinux enforcing, systemd 257
+# refuses to start at all --
+#   systemd[1]: Failed to allocate manager object: Permission denied
+# -- and the image hangs with no login prompt. Rocky 9's older systemd tolerated
+# it, so this only surfaced when 10 was added. Build-time relabelling is
+# impossible on the runner (security.selinux writes return EPERM even as root
+# with all capabilities), so the image relabels on first boot and must therefore
+# be permissive during that boot.
+selinux_setup() {
+  rhel_setup
+  mkdir -p "$ROOT/etc/selinux/targeted/contexts/files" "$ROOT/etc/selinux"
+  : > "$ROOT/etc/selinux/targeted/contexts/files/file_contexts"
+  printf 'SELINUX=enforcing\nSELINUXTYPE=targeted\n' > "$ROOT/etc/selinux/config"
+}
+
+@test "an enforcing image is made permissive with a first-boot relabel" {
+  selinux_setup
+  export SOURCES_FILE=/etc/yum.repos.d/rocky.repo
+
+  run family_relabel
+
+  [ "$status" -eq 0 ]
+  grep -q '^SELINUX=permissive' "$ROOT/etc/selinux/config"
+  [ -f "$ROOT/.autorelabel" ]
+  grep -q '^-F$' "$ROOT/.autorelabel"
+}
+
+# The delivered VM must end up enforcing again, or the security posture is
+# silently downgraded for the image's whole life.
+@test "a unit restores enforcing after the relabel" {
+  selinux_setup
+  export SOURCES_FILE=/etc/yum.repos.d/rocky.repo
+
+  family_relabel
+
+  local u="$ROOT/etc/systemd/system/99-pve-restore-selinux.service"
+  [ -f "$u" ]
+  grep -q 'SELINUX=enforcing' "$u"
+  grep -q 'rm -f /.autorelabel' "$u"
+  [ -L "$ROOT/etc/systemd/system/multi-user.target.wants/99-pve-restore-selinux.service" ]
+}
+
+@test "a non-enforcing image only gets the relabel marker" {
+  selinux_setup
+  export SOURCES_FILE=/etc/yum.repos.d/rocky.repo
+  printf 'SELINUX=disabled\n' > "$ROOT/etc/selinux/config"
+
+  run family_relabel
+
+  [ "$status" -eq 0 ]
+  grep -q '^SELINUX=disabled' "$ROOT/etc/selinux/config"
+  [ -f "$ROOT/.autorelabel" ]
+  [[ "$output" == *"not enforcing"* ]]
+}
+
+@test "an image with no SELinux policy is left alone" {
+  rhel_setup
+  export SOURCES_FILE=/etc/yum.repos.d/rocky.repo
+
+  run family_relabel
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"no SELinux file_contexts"* ]]
+  [ ! -f "$ROOT/.autorelabel" ]
 }
