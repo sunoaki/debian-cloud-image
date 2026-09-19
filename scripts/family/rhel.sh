@@ -29,13 +29,63 @@ family_install_packages() {
   "$pm" -y autoremove
 }
 
-# Rocky and CentOS ship live repo files pointing at mirrorlist URLs, which is
-# correct for them. Nothing to rewrite here; CentOS 7's dead mirrorlist is
-# handled by its own vault drop-in (see config/ and the centos7 entry).
-# Kept as an explicit no-op rather than removing the call so the hook contract
-# stays identical across families.
+# Rocky ships live repo files pointing at mirrorlist URLs, which is correct and
+# left alone. CentOS 7 is different: mirrorlist.centos.org is gone (measured
+# NXDOMAIN, and the guest's yum fails with "Cannot find a valid baseurl"), so the
+# stock repos are dead on arrival and `yum` cannot install anything until they
+# point at the vault. The image's own CentOS-Vault.repo only defines sections up
+# to C7.8.2003, so the 7.9.2009 paths are written fresh.
+#
+# This is why the redirection belongs here rather than at delivery time: without
+# it the build itself cannot install packages, and the shipped template would
+# have a yum that fails for the operator too.
 family_configure_sources() {
-  return 0
+  local repo="$ROOT/etc/yum.repos.d/CentOS-Base.repo" vault="$ROOT/etc/yum.repos.d/99-pve-vault.repo"
+  # Only CentOS 7 needs this; identify it by the repo the matrix names.
+  case "${SOURCES_FILE:-}" in
+  */CentOS-Base.repo) ;;
+  *) return 0 ;;
+  esac
+
+  # Disable the dead mirrorlist-backed repos, then add the vaulted equivalents.
+  # Rewriting in place is what the earlier verification exercised, so the same
+  # shape is used here.
+  if [ -f "$repo" ]; then
+    mkdir -p "$ROOT/etc/yum.repos.d"
+    cat > "$vault" <<'VAULT'
+# PVE cloud-image: CentOS 7 reached end of life on 2024-06-30 and its content
+# moved off the mirrors to vault.centos.org, where it is frozen permanently.
+# mirrorlist.centos.org no longer resolves, so the stock repositories cannot work.
+# No further security updates will ever appear for this release.
+[base]
+name=CentOS-7 - Base (vaulted)
+baseurl=http://vault.centos.org/7.9.2009/os/$basearch/
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+enabled=1
+
+[updates]
+name=CentOS-7 - Updates (vaulted)
+baseurl=http://vault.centos.org/7.9.2009/updates/$basearch/
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+enabled=1
+
+[extras]
+name=CentOS-7 - Extras (vaulted)
+baseurl=http://vault.centos.org/7.9.2009/extras/$basearch/
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+enabled=1
+VAULT
+    # Turn the original file's repositories off rather than deleting it, so the
+    # image still shows what upstream shipped.
+    sed -i 's/^enabled=1/enabled=0/' "$repo"
+    sed -i 's/^mirrorlist=/# mirrorlist=/' "$repo"
+    echo "Rewrote CentOS 7 repositories to the vault at vault.centos.org/7.9.2009"
+  else
+    echo "WARN: $repo not found; CentOS 7 package install will fail" >&2
+  fi
 }
 
 # RHEL family uses grub2-mkconfig directly. The Debian wrapper `update-grub` does
@@ -171,4 +221,25 @@ family_relabel() {
 # its name here.
 family_default_user_alias() {
   printf 'rocky\ncentos\n'
+}
+
+# CentOS 7 is past end of life, so an operator who inherits a VM built from this
+# image should be told plainly rather than discovering it from a failed yum.
+# Printed on first login via the same mechanism as the security notice, and also
+# written into the image's motd so it survives for images whose pam_motd predates
+# motd.d (which is exactly CentOS 7's case).
+family_eol_notice() {
+  case "${SOURCES_FILE:-}" in
+  */CentOS-Base.repo) ;;
+  *) return 0 ;;
+  esac
+  mkdir -p "$(root_path /etc/motd.d)"
+  cat > "$(root_path /etc/motd.d/98-pve-eol)" <<'EOL'
+WARNING: CentOS 7 reached end of life on 2024-06-30.
+
+This image was built from the frozen vault at vault.centos.org/7.9.2009 and will
+never receive another security update. Do not expose it to an untrusted network.
+Plan a migration to a supported release.
+EOL
+  echo "Added a CentOS 7 end-of-life notice to /etc/motd.d/98-pve-eol"
 }

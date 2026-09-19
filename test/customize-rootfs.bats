@@ -410,3 +410,92 @@ bls_setup() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"No BLS entries to check"* ]]
 }
+
+# --- CentOS 7 specifics ------------------------------------------------------
+
+# mirrorlist.centos.org no longer resolves, so the stock repos are dead and the
+# build cannot install anything until they are pointed at the vault. Verified
+# against the real vault earlier: yum -y update reaches "Complete!" with these.
+@test "centos 7 repositories are rewritten to the vault" {
+  rhel_setup
+  export ROOT="$BATS_TEST_TMPDIR/root"
+  export SOURCES_FILE=/etc/yum.repos.d/CentOS-Base.repo
+  mkdir -p "$ROOT/etc/yum.repos.d"
+  printf '[base]\nmirrorlist=http://mirrorlist.centos.org/?release=7&repo=os\nenabled=1\n' \
+    > "$ROOT/etc/yum.repos.d/CentOS-Base.repo"
+
+  family_configure_sources
+
+  local v="$ROOT/etc/yum.repos.d/99-pve-vault.repo"
+  [ -f "$v" ]
+  grep -q 'baseurl=http://vault.centos.org/7.9.2009/os/\$basearch/' "$v"
+  grep -q 'baseurl=http://vault.centos.org/7.9.2009/updates/\$basearch/' "$v"
+  grep -q 'baseurl=http://vault.centos.org/7.9.2009/extras/\$basearch/' "$v"
+  # the dead mirrorlist-backed repos must be off, or yum still tries them
+  grep -q '^enabled=0' "$ROOT/etc/yum.repos.d/CentOS-Base.repo"
+  ! grep -q '^mirrorlist=http' "$ROOT/etc/yum.repos.d/CentOS-Base.repo"
+}
+
+# Rocky's repos are live and must NOT be touched.
+@test "rocky repositories are left alone" {
+  rhel_setup
+  export SOURCES_FILE=/etc/yum.repos.d/rocky.repo
+  mkdir -p "$ROOT/etc/yum.repos.d"
+  printf '[baseos]\nmirrorlist=https://mirrors.rockylinux.org/mirrorlist\nenabled=1\n' \
+    > "$ROOT/etc/yum.repos.d/rocky.repo"
+
+  family_configure_sources
+
+  [ ! -f "$ROOT/etc/yum.repos.d/99-pve-vault.repo" ]
+  grep -q '^enabled=1' "$ROOT/etc/yum.repos.d/rocky.repo"
+}
+
+@test "an end-of-life notice is written for centos 7" {
+  rhel_setup
+  export SOURCES_FILE=/etc/yum.repos.d/CentOS-Base.repo
+
+  family_eol_notice
+
+  local n="$ROOT/etc/motd.d/98-pve-eol"
+  [ -f "$n" ]
+  grep -q '2024-06-30' "$n"
+  grep -q 'never receive another security update' "$n"
+}
+
+@test "no end-of-life notice for rocky" {
+  rhel_setup
+  export SOURCES_FILE=/etc/yum.repos.d/rocky.repo
+
+  family_eol_notice
+
+  [ ! -f "$ROOT/etc/motd.d/98-pve-eol" ]
+}
+
+# CentOS 7's pam_motd predates motd.d, so a notice only in motd.d would never be
+# shown. Every notice must be mirrored into /etc/motd in that case.
+@test "all motd.d notices are mirrored into /etc/motd when motd.d is unsupported" {
+  rhel_setup
+  export SOURCES_FILE=/etc/yum.repos.d/CentOS-Base.repo
+  mkdir -p "$ROOT/etc/cloud" "$ROOT/etc/sysctl.d"
+  printf 'disable_root: 1\n' > "$ROOT/etc/cloud/cloud.cfg"
+  printf 'PermitRootLogin yes\n' > "$ROOT/etc/ssh/sshd_config"
+  # no motd.d reference in pam => the fallback path
+  mkdir -p "$ROOT/etc/pam.d"
+  printf 'session optional pam_motd.so motd=/run/motd.dynamic\n' > "$ROOT/etc/pam.d/sshd"
+  export SYSCTL_FILE="$BATS_TEST_DIRNAME/fixtures/sysctl.conf"
+
+  configure_system
+
+  grep -q 'CentOS 7 reached end of life' "$ROOT/etc/motd"
+  grep -q 'password-based root SSH login' "$ROOT/etc/motd"
+}
+
+# Every family must implement the hooks the shared script calls.
+@test "both families implement family_eol_notice" {
+  for fam in debian rhel; do
+    FAMILY="$fam"
+    FAMILY_DIR="$BATS_TEST_DIRNAME/../scripts/family"
+    load_family
+    [ "$(type -t family_eol_notice)" = "function" ] || { echo "$fam lacks it"; return 1; }
+  done
+}

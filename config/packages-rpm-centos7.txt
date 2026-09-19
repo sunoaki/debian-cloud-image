@@ -1,0 +1,30 @@
+# Packages installed into CentOS 7 PVE cloud images.
+#
+# Deliberately a separate file from packages-rpm.txt rather than the same list,
+# because two entries in the RHEL list do not exist for CentOS 7 at all. Verified
+# against the vaulted repositories (vault.centos.org/7.9.2009/{os,updates,extras})
+# by listing their Packages directories:
+#
+#   zstd   absent from every CentOS 7 repository, and absent from the EPEL 7
+#          archive as well (checked a direct path, HTTP 404).
+#   lldpd  absent from CentOS 7; it exists in EPEL 7, but this project does not
+#          enable EPEL for published images, so it is left out rather than
+#          pulling a third-party repository into a public artifact.
+#
+# Everything below was confirmed present in the vaulted repos.
+qemu-guest-agent
+spice-vdagent
+net-tools
+iputils
+mtr
+bind-utils
+sudo
+bash-completion
+unzip
+wget
+curl
+nano
+less
+vim-enhanced
+bzip2
+tmux

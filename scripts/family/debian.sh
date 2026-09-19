@@ -63,3 +63,10 @@ family_relabel() {
 family_default_user_alias() {
   printf 'ubuntu\n'
 }
+
+# No end-of-life notices for this family: every entry it serves is a supported
+# release. Present as an explicit no-op so the hook contract is uniform and
+# customize-rootfs.sh can call it unconditionally.
+family_eol_notice() {
+  return 0
+}

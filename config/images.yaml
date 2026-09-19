@@ -98,3 +98,38 @@ images:
     family: rhel
     packages_file: config/packages-rpm.txt
     sysctl_file: config/sysctl-rhel.conf
+
+  - distro: rocky
+    codename: red-quartz
+    major: "10"
+    base_url: https://dl.rockylinux.org/pub/rocky/10/images/x86_64
+    image_name: Rocky-10-GenericCloud-Base.latest.x86_64.qcow2
+    sha_file: Rocky-10-GenericCloud-Base.latest.x86_64.qcow2.CHECKSUM
+    hash_cmd: sha256sum
+    sources_file: /etc/yum.repos.d/rocky.repo
+    cloud_cfg: /etc/cloud/cloud.cfg
+    sources_format: rpm
+    family: rhel
+    packages_file: config/packages-rpm.txt
+    sysctl_file: config/sysctl-rhel.conf
+
+  # CentOS 7 reached end of life on 2024-06-30. Its content is frozen on
+  # vault.centos.org and no further security updates exist, so `frozen: true`
+  # keeps it off the weekly schedule: a rebuild would reproduce the same image
+  # under a new date tag and imply maintenance that is not happening. Build it
+  # deliberately with a manual workflow_dispatch.
+  - distro: centos
+    codename: core
+    major: "7"
+    base_url: https://cloud.centos.org/centos/7/images
+    image_name: CentOS-7-x86_64-GenericCloud-2211.qcow2
+    sha_file: sha256sum.txt
+    hash_cmd: sha256sum
+    sources_file: /etc/yum.repos.d/CentOS-Base.repo
+    cloud_cfg: /etc/cloud/cloud.cfg
+    sources_format: rpm
+    family: rhel
+    packages_file: config/packages-rpm-centos7.txt
+    sysctl_file: config/sysctl-rhel.conf
+    frozen: true
+
