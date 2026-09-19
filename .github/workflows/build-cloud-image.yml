@@ -212,6 +212,12 @@ jobs:
         run: |
           sudo qemu-img convert -O qcow2 -c "$SRC_IMAGE" "$RELEASE_NAME"
           rm -f "$SRC_IMAGE"
+          # qemu-img ran as root, so the output is root-owned. The boot test runs
+          # as the unprivileged runner user and could never open it: it failed
+          # with "Could not open ...: Permission denied" and reported only "did not
+          # reach a login prompt", which is why the boot test never passed on any
+          # distro. Hand ownership back to the build user.
+          sudo chown "$(id -u):$(id -g)" "$RELEASE_NAME"
           echo "IMAGE_NAME=$RELEASE_NAME" >> "$GITHUB_ENV"
 
       - name: Upload artifact
