@@ -322,3 +322,29 @@ Plan a migration to a supported release.
 EOL
   echo "Added a CentOS 7 end-of-life notice to /etc/motd.d/98-pve-eol"
 }
+
+# RHEL-family images do not call pam_motd at all: /etc/pam.d/sshd and
+# /etc/pam.d/login have no motd line, so a notice written into /etc/motd or
+# /etc/motd.d is never displayed over SSH or on the console. Debian and Ubuntu do
+# call it, which is why the shared motd work is enough there.
+#
+# Adding the pam line is what makes the notices actually reach an operator.
+# RHEL 7+ ships pam_motd with motd= support (pam-1.1.8 on CentOS 7), and it is
+# already in the image, so this needs no new package. Ordered after the existing
+# session rules and with a leading '-' so a missing file is not an error.
+#
+# This matters most for CentOS 7, whose whole point of the notice is to tell an
+# operator the release is unsupported before they expose it.
+family_enable_motd() {
+  local f added=0
+  for f in "$(root_path /etc/pam.d/sshd)" "$(root_path /etc/pam.d/login)"; do
+    [ -f "$f" ] || continue
+    grep -q 'pam_motd' "$f" && continue
+    printf 'session    optional     pam_motd.so
+' >> "$f"
+    added=$((added + 1))
+  done
+  if [ "$added" -gt 0 ]; then
+    echo "Enabled pam_motd in $added pam config(s) so login notices are shown"
+  fi
+}

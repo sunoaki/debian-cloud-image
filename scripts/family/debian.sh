@@ -70,3 +70,8 @@ family_default_user_alias() {
 family_eol_notice() {
   return 0
 }
+
+# Debian and Ubuntu already call pam_motd, so the shared motd work suffices.
+family_enable_motd() {
+  return 0
+}

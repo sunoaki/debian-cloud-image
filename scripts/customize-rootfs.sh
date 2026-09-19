@@ -175,7 +175,11 @@ MOTD
   # "motd.d": Debian's pam line is `motd=/run/motd.dynamic`, which contains that
   # substring and made this condition wrongly conclude motd.d was supported.
   if ! grep -qs '/etc/motd\.d\|motd_dir=' "$(root_path /etc/pam.d/sshd)" 2>/dev/null; then
-    # Every notice in motd.d, in the same lexicographic order pam_motd would use.
+    # A family may need to be told to consult pam_motd at all (the RHEL family does
+  # not call it, so notices would otherwise never be shown).
+  family_enable_motd
+
+  # Every notice in motd.d, in the same lexicographic order pam_motd would use.
     # Create /etc/motd first: an image need not ship one, and appending to a
     # missing file aborts the build.
     touch "$(root_path /etc/motd)"

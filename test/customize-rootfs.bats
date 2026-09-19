@@ -620,3 +620,53 @@ selinux_setup() {
   [[ "$output" == *"no SELinux file_contexts"* ]]
   [ ! -f "$ROOT/.autorelabel" ]
 }
+
+# --- login notices must actually be displayed --------------------------------
+
+# RHEL-family images never call pam_motd: /etc/pam.d/sshd and /etc/pam.d/login
+# carry no motd line, so a notice in /etc/motd or /etc/motd.d is never shown. For
+# CentOS 7 that defeats the point of the end-of-life warning.
+@test "rhel adds the missing pam_motd line" {
+  rhel_setup
+  mkdir -p "$ROOT/etc/pam.d"
+  printf 'session    required     pam_loginuid.so\nsession    include      password-auth\n' \
+    > "$ROOT/etc/pam.d/sshd"
+  printf 'session    required     pam_selinux.so open\n' > "$ROOT/etc/pam.d/login"
+
+  run family_enable_motd
+
+  [ "$status" -eq 0 ]
+  grep -q 'pam_motd.so' "$ROOT/etc/pam.d/sshd"
+  grep -q 'pam_motd.so' "$ROOT/etc/pam.d/login"
+  [[ "$output" == *"2 pam config(s)"* ]]
+}
+
+@test "an existing pam_motd line is not duplicated" {
+  rhel_setup
+  mkdir -p "$ROOT/etc/pam.d"
+  printf 'session    optional     pam_motd.so motd=/run/motd.dynamic\n' > "$ROOT/etc/pam.d/sshd"
+  printf 'session    required     pam_loginuid.so\n' > "$ROOT/etc/pam.d/login"
+
+  run family_enable_motd
+
+  [ "$status" -eq 0 ]
+  [ "$(grep -c 'pam_motd' "$ROOT/etc/pam.d/sshd")" -eq 1 ]
+  grep -q 'pam_motd' "$ROOT/etc/pam.d/login"
+}
+
+@test "rhel tolerates missing pam files" {
+  rhel_setup
+
+  run family_enable_motd
+
+  [ "$status" -eq 0 ]
+}
+
+@test "both families implement family_enable_motd" {
+  for fam in debian rhel; do
+    FAMILY="$fam"
+    FAMILY_DIR="$BATS_TEST_DIRNAME/../scripts/family"
+    load_family
+    [ "$(type -t family_enable_motd)" = "function" ] || { echo "$fam lacks it"; return 1; }
+  done
+}
