@@ -5,7 +5,7 @@
 ## 构建流程
 
 1. 从官方源下载云镜像并校验 checksum
-2. `qemu-nbd` 挂载 → **chroot 原生包管理定制**（Debian 系用 apt，RHEL 系用 dnf/yum；不使用 TCG/虚拟机模拟，构建速度快）
+2. `qemu-nbd` 挂载 → **chroot 原生包管理定制**（Debian 系用 apt，RHEL 系用 dnf/yum；不使用 TCG/虚拟机模拟，构建速度快）；需要 ESP 的条目（目前只有 CentOS 7）在这一步之前追加 ESP
 3. 压缩为 qcow2，并做一次启动测试（RHEL 系默认开启，Debian 系默认关闭；`BOOT_TEST=true/false` 可强制）
 4. `release` job 合并所有版本的镜像，按日期发布单个 Release
 
@@ -22,6 +22,7 @@
 
 Release tag 为 `YYYYMMDD`；同一天重复构建会先删除当天的旧 Release 再发布新版本。
 `frozen: true` 的条目在定时构建里被跳过，因为上游内容已冻结，重建只会产生内容相同、日期不同的产物。
+`efi_esp: true` 的条目会在构建时得到一个 ESP，用于上游只提供 BIOS 引导的发行版，目前只有 CentOS 7。
 
 ## 镜像定制内容
 
@@ -105,11 +106,13 @@ qm set 9000 --agent enabled=1 --ostype l26
 qm template 9000
 ```
 
-这 8 个镜像的 `qm create` 参数相同，无需按发行版区分，固件选择如下。
+这 8 个镜像的 `qm create` 参数相同，无需按发行版区分，也无需按发行版选固件：全部 8 个条目都同时带有 ESP 与 BIOS 引导路径，SeaBIOS（PVE 默认）和 OVMF 都能启动，两条路径都已在本地各测一遍，全部到达 login 提示。PVE 上保持默认的 SeaBIOS，或在 VM 的「硬件 → BIOS」里选 OVMF，两者都可以。
 
-7 个条目同时带有 ESP 与 BIOS 引导分区，SeaBIOS（PVE 默认）和 OVMF 都能启动，两条路径都已在本地各测一遍：8 个条目在 SeaBIOS 下、7 个带 ESP 的条目在 OVMF 下，全部到达 login 提示。CentOS 7 是唯一例外，它只有 MBR 上的 BIOS 引导路径，必须用 SeaBIOS；选 OVMF 时固件没有可引导的对象，启动会在固件阶段停下。
+CentOS 7 是唯一需要额外处理的条目：上游的 GenericCloud 镜像从来没有 UEFI 变体，它只有一个 MBR 分区、完全没有 ESP，所以这个 ESP 是流水线自己加的（`config/images.yaml` 的 `efi_esp: true`）——构建时在磁盘尾部追加一个 100MiB 的 FAT32 分区，由 `rhel.sh` 从镜像自身的仓库装 `grub2-efi-x64`、`grub2-efi-x64-modules`、`shim-x64`（连带 `mokutil`、`efivar-libs`），并把 `/boot/efi` 写进 `/etc/fstab`。原有的 MBR 引导路径完全不动，所以两条固件路径都可用。
 
-ESP 里只有引导器，内核与 initramfs 放在 root 分区或独立的 `/boot` 分区（Rocky 是 XBOOTLDR 类型的 `p3`）上，所以给模板装新内核不占 ESP 空间。实测 Rocky 10 的 ESP 占用 13.8MiB（容量 199.7MiB），其 `p3` 的 `/boot` 占用 372MiB（容量 936MiB）。
+CentOS 7 需要**两份** grub.cfg，这与 Rocky 不同：Rocky 的 `/boot/grub2/grub.cfg` 里没有内核命令名（内容是 `blscfg` 调用，由它在运行时按固件选），所以 Rocky 的 ESP 配置只需指向 root 分区上的那份；CentOS 7 的 grub.cfg 里写着真正的内核命令行，BIOS 用的是 `linux16`/`initrd16`、UEFI 用的是 `linuxefi`/`initrdefi`，两个名字在对方的 GRUB 里都不存在。因此 BIOS 那份写成 `linux16`，ESP 上那份写成 `linuxefi`，各自钉死。
+
+ESP 里只有引导器，内核与 initramfs 放在 root 分区或独立的 `/boot` 分区（Rocky 是 XBOOTLDR 类型的 `p3`）上，所以给模板装新内核不占 ESP 空间。实测 Rocky 10 的 ESP 占用 13.8MiB（容量 199.7MiB），其 `p3` 的 `/boot` 占用 372MiB（容量 936MiB）；CentOS 7 新加的 ESP 容量 100MiB。
 
 之后从模板克隆 VM，在 VM 的 Cloud-init 面板设置 user=`root` 和密码即可通过 SSH 密码登录。
 
@@ -136,12 +139,12 @@ ESP 里只有引导器，内核与 initramfs 放在 root 分区或独立的 `/bo
 | Ubuntu 24.04 | GPT | p1 | p16 | p15 | efi |
 | Ubuntu 26.04 | GPT | p1 | p13 | p15 | efi |
 | Rocky 9 / 10 | GPT | p4 | p3 (XBOOTLDR) | p2 | efi |
-| CentOS 7 | MBR | p1 | 无 | 无 | bios |
+| CentOS 7 | MBR | p1 | 无 | p2 (构建时新加) | efi |
 
 Rocky 的 root 在 p4 而非 p1，这是本表逐条实测的原因：p1 是 `p.legacy`（BIOS boot 分区，类型 `21686148-…`），p2 是 ESP，p3 是 XBOOTLDR。root 分区由内容判定（找 `/etc`），因此这个编号差异不需要脚本知道。
 
-上表除 CentOS 7 外的每个条目都同时有 BIOS boot 分区与 ESP，这是两条固件路径都能启动的原因。BIOS boot 分区是 Debian 与 Ubuntu 的 p14（Rocky 的 p1）；两张表里都没有列它，因为它不含文件系统，只承载 GRUB 的 core 镜像。
+上表每个条目都同时有 BIOS 引导路径与 ESP，这是两条固件路径都能启动的原因。BIOS 引导路径是 Debian 与 Ubuntu 的 BIOS boot 分区 p14（Rocky 的 p1）加上 CentOS 7 的 MBR；两张表里都没有列前者，因为它不含文件系统，只承载 GRUB 的 core 镜像。
 
-`启动测试使用的固件` 取自 CI 日志里的 `Firmware for boot test:` 一行。固件由 `scripts/partition-layout.sh` 的 `layout_firmware()` 依分区类型判定：有 ESP 类型的分区就走 UEFI。RHEL 系默认开启启动测试（`vars.BOOT_TEST`），Debian 系默认关闭，因此上表 Debian/Ubuntu 条目记录的是固件判定结果，不是实际跑过的启动记录。
+`启动测试使用的固件` 取自 CI 日志里的 `Firmware for boot test:` 一行。固件由 ESP 决定：`scripts/partition-layout.sh` 的 `layout_firmware()` 依分区类型判定（GPT 上是 `c12a7328-…` 这个 GUID，MBR 上是 `0xef` 这个类型字节），而 CentOS 7 的 ESP 是构建时加的，所以 `scripts/customize-image.sh` 在算出要建 ESP 时就记成 `efi`，不再看初始分区表。一次构建只能测一种固件，因此 CentOS 7 的 UEFI 路径由 CI 启动测试覆盖、BIOS 路径由 SeaBIOS 本地实测覆盖。RHEL 系默认开启启动测试（`vars.BOOT_TEST`），Debian 系默认关闭，因此上表 Debian/Ubuntu 条目记录的是固件判定结果，不是实际跑过的启动记录。
 
 新增发行版只需在 `config/images.yaml` 里加一条记录（并在 PVE 侧 `update-cloud-templates.sh` 里加一个模板 VMID），产物会自动变为 `<distro>-<major>-pve-sunoaki+YYYYMMDD.qcow2` 并合并进同一个 Release。若上游镜像的根文件系统是 XFS，`family: rhel` 会走挂载后 `xfs_growfs` 的扩容路径（runner 需装 `xfsprogs`）；ext4 走挂载前 `resize2fs`。两者的顺序不可互换。

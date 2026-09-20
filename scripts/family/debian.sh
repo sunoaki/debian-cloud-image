@@ -75,3 +75,13 @@ family_eol_notice() {
 family_enable_motd() {
   return 0
 }
+
+# Debian and Ubuntu images already ship an ESP with the bootloader on it, so there
+# is nothing to configure: the two steps in configure_system are no-ops here.
+family_esp_configure() {
+  return 0
+}
+
+family_esp_write_config() {
+  return 0
+}

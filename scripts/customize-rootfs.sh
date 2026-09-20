@@ -123,10 +123,29 @@ configure_system() {
   else
     printf '# disables OS prober to avoid loopback detection which breaks booting\nGRUB_DISABLE_OS_PROBER=true\n' >> "$grub_cfg"
   fi
+  # Bootloader, in this order and no other. The reason is that grub2-mkconfig
+  # picks the kernel command name from the platform it sees, and inside this
+  # chroot that platform is the build host's, not the image's:
+  #
+  #   * /etc/grub.d/10_linux (read out of the stock CentOS 7 image) emits
+  #     linux16/initrd16 when /sys/firmware/efi does not exist and
+  #     linuxefi/initrdefi when it does.
+  #   * The stock CentOS 7 /boot/grub2/grub.cfg is a plain file containing real
+  #     menu entries - linux16/initrd16, not a blscfg call as on Rocky - so the
+  #     command name is baked into whichever config gets generated.
+  #
+  # One config therefore cannot serve both firmwares, and the two are generated as
+  # two files: family_update_bootloader pins the BIOS one to the BIOS command
+  # names, family_esp_write_config generates a second file on the ESP pinned to
+  # the EFI ones. Rocky 9/10 need none of this on the ESP side because their
+  # grub.cfg is a blscfg call with no command name in it at all.
+  #
   # Needs /proc mounted and the grub tools present, so it only makes sense in
   # production. In tests ROOT!=/ so skip.
   if [ "$ROOT" = "/" ]; then
     family_update_bootloader
+    family_esp_configure
+    family_esp_write_config
   fi
 
   # Serial console on ttyS1 (default PVE serial terminal). Create the wants

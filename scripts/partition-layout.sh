@@ -68,17 +68,64 @@ layout_boot_candidates_from_types() {
 }
 
 
-# Print the firmware a boot test should use, given GPT partition type GUIDs one
+# Print the size in sectors of the ESP an image needs, or nothing when no ESP
+# should be created: either the image already has one (matched by the same type
+# values layout_firmware reads, so GPT's GUID and MBR's 0xef both count), or the
+# matrix entry did not ask for one.
+#
+# `want` is the matrix's efi_esp field and only `true` or `1` ask for an ESP. An
+# absent field, and every other value including a typo, means "create nothing":
+# the caller passes the field through unchanged, so an entry that says nothing
+# reaches this function as an empty string. Defaulting the other way - to "create
+# one" - would silently give an ESP to every image in the matrix that does not
+# already have one, which is a published artifact changed by a field nobody wrote.
+#
+# 204800 sectors = 100MiB, matching the ESP measured on the stock Rocky images
+# (100MiB on Rocky 9, 199.7MiB on Rocky 10). It holds a bootloader only - the
+# kernels stay on the root filesystem - so 100MiB is ample.
+layout_esp_plan() {
+  local want="$1" types="$2"
+  case "$want" in
+  1 | true) ;;
+  *) return 0 ;;
+  esac
+  if printf '%s\n' "$types" | grep -qiE '^(c12a7328-f81f-11d2-ba4b-00a0c93ec93b|0xef)$'; then
+    return 0
+  fi
+  printf '204800\n'
+}
+
+# Print the firmware a boot test should use, given partition *type* values one
 # per line ($1). Prints nothing when the list is empty, so the caller can warn
 # and fall back rather than silently choosing.
+#
+# The value's shape depends on the partition table label, and both shapes come
+# from the same `partx -o TYPE` call: a GPT partition type is a GUID, while an
+# MBR partition type is the one-byte type code printed as hex (`0xef` for an EFI
+# System Partition). Matching only the GUID meant an MBR image carrying a real
+# ESP was still reported as BIOS, so a CentOS 7 image that we added an ESP to
+# would have been boot-tested with the wrong firmware and the test would have
+# failed for a reason unrelated to the image.
 layout_firmware() {
   local guids="$1"
   [ -n "$guids" ] || return 0
-  if printf '%s\n' "$guids" | grep -qi '^c12a7328-f81f-11d2-ba4b-00a0c93ec93b$'; then
+  if printf '%s\n' "$guids" | grep -qiE '^(c12a7328-f81f-11d2-ba4b-00a0c93ec93b|0xef)$'; then
     printf 'efi\n'
   else
     printf 'bios\n'
   fi
+}
+
+# Print the sector where a new partition appended after the current last one
+# must end, so it lands flush with the end of the disk while still starting on a
+# 1MiB boundary. The slack below the start is the price of that alignment.
+#
+# Arguments: total sectors on the disk, wanted size in sectors.
+layout_esp_geometry() {
+  local total="$1" size="$2" end start
+  end=$((total - 1))
+  start=$(((end - size + 1) / 2048 * 2048))
+  printf '%s %s\n' "$start" "$end"
 }
 
 # Succeeds when the kernel exposes at least as many partitions as the on-disk
