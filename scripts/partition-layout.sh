@@ -116,6 +116,22 @@ layout_firmware() {
   fi
 }
 
+# Print the device node for partition $2 of disk $1.
+#
+# The kernel does not always join the two with a bare number. When the disk name
+# itself ends in a digit it inserts a `p` first, because the digit alone would be
+# ambiguous: /dev/nbd0 + 2 is /dev/nbd0p2, while /dev/sda + 2 is /dev/sda2.
+# Concatenating without that rule produced /dev/nbd02, which does not exist, and
+# mkfs.vfat failed with "unable to open /dev/nbd02: No such file or directory" on
+# the first real CentOS 7 build (CI run 35488757900).
+layout_partition_dev() {
+  local disk="$1" num="$2"
+  case "$disk" in
+  *[0-9]) printf '%sp%s\n' "$disk" "$num" ;;
+  *) printf '%s%s\n' "$disk" "$num" ;;
+  esac
+}
+
 # Print the sector where a new partition appended after the current last one
 # must end, so it lands flush with the end of the disk while still starting on a
 # 1MiB boundary. The slack below the start is the price of that alignment.

@@ -188,6 +188,26 @@ c12a7328-f81f-11d2-ba4b-00a0c93ec93b')" ]
   done
 }
 
+# --- partition device names ------------------------------------------------
+
+# The failure this covers: the first real CentOS 7 build (CI run 35488757900)
+# concatenated the disk name and the partition number and got /dev/nbd02, so
+# mkfs.vfat reported "unable to open /dev/nbd02: No such file or directory" and
+# the build died before the image was ever booted.
+@test "a disk name ending in a digit gets a p before the partition number" {
+  [ "$(layout_partition_dev /dev/nbd0 2)" = "/dev/nbd0p2" ]
+  [ "$(layout_partition_dev /dev/nbd0 15)" = "/dev/nbd0p15" ]
+}
+
+@test "a disk name not ending in a digit takes the bare number" {
+  [ "$(layout_partition_dev /dev/sda 2)" = "/dev/sda2" ]
+  [ "$(layout_partition_dev /dev/vda 1)" = "/dev/vda1" ]
+}
+
+@test "a loop device keeps its trailing digit's p separator" {
+  [ "$(layout_partition_dev /dev/loop0 3)" = "/dev/loop0p3" ]
+}
+
 # --- slot count (the original incident) ------------------------------------
 
 @test "a hidden partition is detected as insufficient slots" {

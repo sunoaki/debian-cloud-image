@@ -242,7 +242,7 @@ if [ -n "$ESP_SIZE_SECTORS" ]; then
   printf 'start=%s, size=%s, type=ef\n' "$ESP_START" "$ESP_SIZE_SECTORS" |
     sfdisk --no-reread --append "$DISKDEV"
   partprobe "$DISKDEV" || true
-  ESPDEV=$DISKDEV$ESP_PARTNUM
+  ESPDEV=$(layout_partition_dev "$DISKDEV" "$ESP_PARTNUM")
   wait_for_partitions "$((table_parts + 1))" || {
     echo "Timed out waiting for the new ESP node $ESPDEV to appear" >&2
     exit 1
