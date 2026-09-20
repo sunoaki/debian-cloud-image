@@ -162,7 +162,7 @@ family_update_bootloader() {
     return 1
   fi
 
-  grub2_mkconfig_for_firmware
+  grub2_mkconfig_bios
 }
 
 # grub2-mkconfig decides which linux/initrd command to emit from the platform it
@@ -172,38 +172,191 @@ family_update_bootloader() {
 # failed to boot with "error: can't find command `linuxefi'". The stock upstream
 # image correctly uses linux16/initrd16.
 #
-# The firmware is already known from the partition table (no ESP => BIOS), so pin
-# the generation to it instead of letting the build host decide. For a BIOS image
-# that means asking for the i386-pc platform explicitly; for UEFI the default is
-# already right.
-grub2_mkconfig_for_firmware() {
-  if [ "${FIRMWARE:-}" = "bios" ]; then
-    if ! grub2-mkconfig -o "$(root_path /boot/grub2/grub.cfg)" 2>/dev/null; then
-      echo "grub2-mkconfig failed" >&2
-      return 1
-    fi
-    # Rewrite any EFI-only command names back to their BIOS equivalents. This is
-    # deliberately a textual correction rather than another mkconfig run: the
-    # command name is the only platform-specific part of these entries, and the
-    # alternative (trusting detection inside the chroot) is what broke.
-    local cfg fixed=0
-    cfg="$(root_path /boot/grub2/grub.cfg)"
-    if grep -q '\blinuxefi\b\|\binitrdefi\b' "$cfg"; then
-      sed -i 's/\blinuxefi\b/linux16/g; s/\binitrdefi\b/initrd16/g' "$cfg"
-      fixed=1
-    fi
-    if [ "$fixed" -eq 1 ]; then
-      echo "Rewrote EFI-only linuxefi/initrdefi to linux16/initrd16 for a BIOS image"
-    fi
-    # Prove the result: a BIOS image must not carry EFI-only commands.
-    if grep -q '\blinuxefi\b\|\binitrdefi\b' "$cfg"; then
-      echo "grub.cfg still contains EFI-only commands on a BIOS image;" >&2
-      echo "the image would fail to boot with \"can't find command \`linuxefi'\"." >&2
-      return 1
-    fi
-  else
-    grub2-mkconfig -o "$(root_path /boot/grub2/grub.cfg)"
+# The platform test behind that is `[ -d /sys/firmware/efi ]` in
+# /etc/grub.d/10_linux, which inside the chroot asks about the *runner*. GitHub's
+# runners are UEFI-booted, which is exactly why the BIOS-only image came out with
+# EFI command names.
+#
+# So each generated config is pinned to the firmware that will read it, and the two
+# are pinned independently: the BIOS config in /boot/grub2 (written by
+# grub2_mkconfig_bios) and the ESP config (written by grub2_mkconfig_efi). The
+# firmware a *boot test* should use is a different question and is not what decides
+# this: the CentOS 7 entry of config/images.yaml ends up with both an ESP and its
+# original MBR path, so FIRMWARE=efi there while the BIOS config still has to be
+# written and pinned to BIOS command names.
+#
+# The rewrite covers both spellings because the two grub generations do not agree:
+# CentOS 7 and Rocky 9 emit `linux16` for BIOS, while Rocky 10's newer grub emits
+# plain `linux`. Only `linux16` has an EFI counterpart (`linuxefi`); `linux` is
+# already valid on both platforms and must be left alone. Rewriting `linux` would
+# turn it into `linuxefi`, which the BIOS GRUB then cannot find - the same failure
+# in the other direction.
+
+# Generate /boot/grub2/grub.cfg - the file the BIOS GRUB reads - and pin it to the
+# BIOS command names.
+grub2_mkconfig_bios() {
+  local cfg
+  if ! grub2-mkconfig -o "$(root_path /boot/grub2/grub.cfg)" 2>/dev/null; then
+    echo "grub2-mkconfig failed" >&2
+    return 1
   fi
+  # Rewrite any EFI-only command names back to their BIOS equivalents. This is
+  # deliberately a textual correction rather than another mkconfig run: the
+  # command name is the only platform-specific part of these entries, and the
+  # alternative (trusting detection inside the chroot) is what broke.
+  cfg="$(root_path /boot/grub2/grub.cfg)"
+  if grep -q '\blinuxefi\b\|\binitrdefi\b' "$cfg"; then
+    sed -i 's/\blinuxefi\b/linux16/g; s/\binitrdefi\b/initrd16/g' "$cfg"
+    echo "Rewrote EFI-only linuxefi/initrdefi to linux16/initrd16 in the BIOS grub.cfg"
+  fi
+  # Prove the result: a BIOS image must not carry EFI-only commands.
+  if grep -q '\blinuxefi\b\|\binitrdefi\b' "$cfg"; then
+    echo "grub.cfg still contains EFI-only commands on a BIOS image;" >&2
+    echo "the image would fail to boot with \"can't find command \`linuxefi'\"." >&2
+    return 1
+  fi
+}
+
+# Generate the ESP's own grub.cfg and pin it to the EFI command names. The file
+# path is the caller's, because both the vendor path and the removable-media path
+# carry a copy of it (see family_esp_write_config).
+grub2_mkconfig_efi() {
+  local cfg="$1"
+  if ! grub2-mkconfig -o "$cfg" 2>/dev/null; then
+    echo "grub2-mkconfig for $cfg failed" >&2
+    return 1
+  fi
+  # Only the BIOS spelling is converted here, in the opposite direction of
+  # grub2_mkconfig_bios: plain `linux` (which newer grub emits and which EFI GRUB
+  # also accepts) is left alone.
+  if grep -q '\blinux16\b\|\binitrd16\b' "$cfg"; then
+    sed -i 's/\blinux16\b/linuxefi/g; s/\binitrd16\b/initrdefi/g' "$cfg"
+    echo "Rewrote linux16/initrd16 to linuxefi/initrdefi in the ESP grub.cfg"
+  fi
+  # Prove it: an EFI config that still asks for a 16-bit command would abort with
+  # "error: can't find command `linux16'" before reaching a kernel.
+  if grep -q '\blinux16\b\|\binitrd16\b' "$cfg"; then
+    echo "The ESP grub.cfg still contains BIOS-only commands;" >&2
+    echo "the image would fail to boot under UEFI with \"can't find command \`linux16'\"." >&2
+    return 1
+  fi
+  # A config with no kernel entry at all would also never boot, and would pass the
+  # two checks above. Rocky 9/10 emit no command name (their entries are a blscfg
+  # call, which picks the right one at runtime), so this accepts either spelling.
+  if ! grep -qE '^[[:space:]]*(linuxefi|linux|blscfg)\b' "$cfg"; then
+    echo "The ESP grub.cfg has no kernel entry and no blscfg call" >&2
+    return 1
+  fi
+}
+
+# Write the ESP's grub.cfg and the copy the removable-media path reads.
+#
+# The file has real menu entries rather than a pointer at the BIOS one, because the
+# two platforms cannot share entries here: CentOS 7's GRUB speaks linux16/initrd16
+# for BIOS and linuxefi/initrdefi for EFI, and neither name exists in the other
+# platform's GRUB. See grub2_mkconfig_efi for why Rocky can share and CentOS 7
+# cannot.
+#
+# Written to the ESP so a kernel update of a running VM repoints it too, and
+# generated from the same /etc/grub.d templates as the BIOS config, so the entries
+# and the kernel command line stay identical between the two paths.
+family_esp_write_config() {
+  [ -n "${ESP_UUID:-}" ] || return 0
+  [ -f /boot/efi/EFI/centos/grubx64.efi ] || return 0
+
+  local cfg=/boot/efi/EFI/centos/grub.cfg
+  grub2_mkconfig_efi "$cfg" || return 1
+
+  # The removable-media path needs the same config: a firmware with no NVRAM boot
+  # entry starts BOOTX64.EFI, and that GRUB has to find a menu.
+  cp -a "$cfg" /boot/efi/EFI/BOOT/grub.cfg
+
+  # Make the ESP a mount point for later kernel updates. Without this line the
+  # running VM's /boot/efi is an empty directory and a kernel update would refresh
+  # the kernel on the root filesystem while the firmware kept reading the old
+  # payload off the ESP. Rocky's own images ship this line; CentOS 7's does not.
+  if ! grep -q '[[:space:]]/boot/efi[[:space:]]' "$(root_path /etc/fstab)"; then
+    printf 'UUID=%s /boot/efi vfat defaults,umask=0077,shortname=winnt 0 0\n' \
+      "$ESP_UUID" >> "$(root_path /etc/fstab)"
+    echo "Added /boot/efi to /etc/fstab"
+  fi
+}
+
+# --- EFI system partition ---------------------------------------------------
+#
+# The hooks below configure UEFI boot for an image whose bootloader lives on an
+# ESP that customize-image.sh created and mounted at /boot/efi. They are no-ops
+# unless that ESP exists, so they are safe to call for every entry in the matrix.
+#
+# The shape of the result is the one Red Hat already ships on Rocky, which is the
+# only tested layout in this family; the stock Rocky 9/10 images were read to
+# confirm it rather than assumed:
+#
+#   ESP/EFI/BOOT/{BOOTX64.EFI,grubx64.efi,grub.cfg}   the removable-media path,
+#                                                     which is what OVMF booted
+#   ESP/EFI/centos/{shimx64.efi,grubx64.efi,grub.cfg} the vendor path
+#
+# Rocky's own generated EFI/centos/grub.cfg is a three-line pointer at the root
+# filesystem's grub.cfg rather than a copy of it:
+#
+#   search --fs-uuid --set=root <root fs uuid>
+#   set prefix=($root)/grub2
+#   configfile ($root)/grub2/grub.cfg
+#
+# That works for Rocky because its /boot/grub2/grub.cfg holds no kernel command
+# name to get wrong - it is a blscfg call, and blscfg picks the right command per
+# platform at runtime. CentOS 7's grub.cfg does hold the command names, so the same
+# pointer would make both firmwares share one spelling and only one of them would
+# boot. Where the ESP is one the pipeline created (an efi_esp entry), the file is
+# therefore a real config pinned to EFI, written by family_esp_write_config; on
+# every other entry the pipeline writes nothing here and the distro's own file is
+# left exactly as it shipped.
+family_esp_configure() {
+  [ -n "${ESP_UUID:-}" ] || return 0
+  [ -d /boot/efi ] || return 0
+
+  # EFI/BOOT is the fallback path a UEFI firmware uses when its NVRAM has no boot
+  # entry - and a cloned VM has none, because the image is distributed without any
+  # NVRAM. Measured on CentOS 7 under OVMF: "System BootOrder not found.
+  # Initializing defaults." then a boot entry built for \EFI\centos\shimx64.efi.
+  mkdir -p /boot/efi/EFI/centos /boot/efi/EFI/BOOT
+
+  if rpm -q grub2-efi-x64 >/dev/null 2>&1; then
+    echo "grub2-efi-x64 is already installed; reusing the image's own EFI binaries"
+  else
+    echo "Installing the EFI bootloader packages from the image's configured repositories"
+    # shim-x64 is what makes Secure Boot possible at all and is what the firmware
+    # prefers to start; mokutil and efivar-libs are its dependencies. Both packages
+    # install their payloads straight into /boot/efi/EFI/centos, which is the ESP
+    # mounted above, so nothing needs copying afterwards:
+    #   shim-x64        shimx64.efi, shimx64-centos.efi, mmx64.efi, shim.efi
+    #   grub2-efi-x64   grubx64.efi, fonts/unicode.pf2
+    # (file lists read from the RPMs themselves, grub2-efi-x64 2.02-0.87.0.2 and
+    # shim-x64 15-8). grub2-efi-x64-modules lands in /usr/lib/grub/x86_64-efi and is
+    # what lets a running VM reinstall the EFI bootloader later.
+    if ! yum -y install grub2-efi-x64 grub2-efi-x64-modules shim-x64; then
+      echo "Could not install the EFI bootloader packages" >&2
+      return 1
+    fi
+  fi
+
+  [ -f /boot/efi/EFI/centos/grubx64.efi ] || {
+    echo "grubx64.efi is still missing after installing the packages" >&2
+    return 1
+  }
+  [ -f /boot/efi/EFI/centos/shimx64.efi ] || {
+    echo "shimx64.efi is still missing after installing the packages" >&2
+    return 1
+  }
+
+  # The removable-media path carries the same two stages under the names a
+  # firmware looks for when it has been told nothing: BOOTX64.EFI is read as the
+  # first stage whatever it is, so shim goes there and grubx64.efi sits beside it.
+  cp -a /boot/efi/EFI/centos/shimx64.efi /boot/efi/EFI/BOOT/BOOTX64.EFI
+  cp -a /boot/efi/EFI/centos/grubx64.efi /boot/efi/EFI/BOOT/grubx64.efi
+
+  echo "ESP contents:"
+  find /boot/efi -name '*.efi' | sort
 }
 
 # The unit is sshd, not ssh. The motd text tells the operator to reload it.

@@ -491,6 +491,11 @@ bls_setup() {
 # cannot run those, so the image failed to boot with
 #   error: can't find command `linuxefi'
 # while the stock upstream image correctly used linux16/initrd16.
+#
+# Each config file is pinned to the firmware that will read it, and the two are
+# pinned independently of FIRMWARE: a CentOS 7 image that gets an ESP keeps its MBR
+# path as well, so its FIRMWARE is efi while its BIOS config still has to be
+# written and pinned to BIOS command names.
 grub_setup() {
   rhel_setup
   mkdir -p "$ROOT/boot/grub2"
@@ -499,12 +504,11 @@ grub_setup() {
   grub2-mkconfig() { :; }
 }
 
-@test "EFI-only commands are rewritten for a BIOS image" {
+@test "EFI-only commands are rewritten for the BIOS grub.cfg" {
   grub_setup
-  export FIRMWARE=bios
   printf 'linuxefi /vmlinuz-x\ninitrdefi /initramfs-x.img\n' > "$ROOT/boot/grub2/grub.cfg"
 
-  run grub2_mkconfig_for_firmware
+  run grub2_mkconfig_bios
 
   [ "$status" -eq 0 ]
   grep -q '^linux16 /vmlinuz-x' "$ROOT/boot/grub2/grub.cfg"
@@ -512,45 +516,107 @@ grub_setup() {
   ! grep -q 'linuxefi\|initrdefi' "$ROOT/boot/grub2/grub.cfg"
 }
 
-@test "a BIOS image with no EFI-only commands is left alone" {
+@test "a BIOS config with no EFI-only commands is left alone" {
   grub_setup
-  export FIRMWARE=bios
   printf 'linux16 /vmlinuz-x\ninitrd16 /initramfs-x.img\n' > "$ROOT/boot/grub2/grub.cfg"
 
-  run grub2_mkconfig_for_firmware
+  run grub2_mkconfig_bios
 
   [ "$status" -eq 0 ]
   [[ "$output" != *"Rewrote EFI-only"* ]]
   grep -q '^linux16 ' "$ROOT/boot/grub2/grub.cfg"
 }
 
-@test "a UEFI image keeps its EFI commands" {
-  grub_setup
-  export FIRMWARE=efi
-  printf 'linuxefi /vmlinuz-x\ninitrdefi /initramfs-x.img\n' > "$ROOT/boot/grub2/grub.cfg"
-
-  run grub2_mkconfig_for_firmware
-
-  [ "$status" -eq 0 ]
-  grep -q 'linuxefi' "$ROOT/boot/grub2/grub.cfg"
-  ! grep -q 'linux16' "$ROOT/boot/grub2/grub.cfg"
-}
-
 # The guard that stops a non-booting image shipping, the way the PARTUUID one did.
-@test "a BIOS image still holding EFI commands is rejected" {
+@test "a BIOS config still holding EFI commands is rejected" {
   grub_setup
-  export FIRMWARE=bios
   printf 'linuxefi /vmlinuz-x\n' > "$ROOT/boot/grub2/grub.cfg"
   # make the rewrite a no-op so the guard is what fails the function
-  sed() { command sed "$@"; }
   run bash -c '
     source "'"$BATS_TEST_DIRNAME"'/../scripts/family/rhel.sh"
     root_path(){ printf "%s%s\n" "$ROOT" "$1"; }
     grub2-mkconfig(){ :; }
     sed(){ :; }
-    grub2_mkconfig_for_firmware'
+    grub2_mkconfig_bios'
   [ "$status" -ne 0 ]
   [[ "$output" == *"EFI-only commands on a BIOS image"* ]]
+}
+
+# The BIOS config is pinned to BIOS regardless of what FIRMWARE says, because on a
+# dual-firmware image FIRMWARE names the firmware the *boot test* uses, not the one
+# that reads /boot/grub2/grub.cfg. Getting this backwards is the same shipped-image
+# failure as above, only reachable via the efi_esp path.
+@test "the BIOS config is pinned to BIOS even when FIRMWARE is efi" {
+  grub_setup
+  export FIRMWARE=efi
+  printf 'linuxefi /vmlinuz-x\ninitrdefi /initramfs-x.img\n' > "$ROOT/boot/grub2/grub.cfg"
+
+  run grub2_mkconfig_bios
+
+  [ "$status" -eq 0 ]
+  grep -q '^linux16 /vmlinuz-x' "$ROOT/boot/grub2/grub.cfg"
+  ! grep -q 'linuxefi\|initrdefi' "$ROOT/boot/grub2/grub.cfg"
+}
+
+# The mirror image of the above: the ESP config is pinned to EFI no matter what
+# FIRMWARE says, since EFI GRUB is what reads it either way.
+@test "the ESP config is rewritten to EFI command names" {
+  grub_setup
+  mkdir -p "$ROOT/boot/efi/EFI/centos"
+  local cfg="$ROOT/boot/efi/EFI/centos/grub.cfg"
+  printf 'linux16 /vmlinuz-x\ninitrd16 /initramfs-x.img\n' > "$cfg"
+
+  run grub2_mkconfig_efi "$cfg"
+
+  [ "$status" -eq 0 ]
+  grep -q '^linuxefi /vmlinuz-x' "$cfg"
+  grep -q '^initrdefi /initramfs-x.img' "$cfg"
+  ! grep -q 'linux16\|initrd16' "$cfg"
+}
+
+# Rocky 9/10 emit no command name at all (their entries are a blscfg call which
+# picks the right one at runtime), so the ESP check must accept that shape rather
+# than demand linuxefi.
+@test "the ESP config accepts a blscfg-only config such as Rocky's" {
+  grub_setup
+  local cfg="$ROOT/boot/efi/EFI/centos/grub.cfg"
+  mkdir -p "$(dirname "$cfg")"
+  printf 'insmod blscfg\nblscfg\n' > "$cfg"
+
+  run grub2_mkconfig_efi "$cfg"
+
+  [ "$status" -eq 0 ]
+}
+
+# A config with no kernel entry and no blscfg would never boot while passing every
+# other check, so it is rejected outright.
+@test "the ESP config with no kernel entry and no blscfg is rejected" {
+  grub_setup
+  local cfg="$ROOT/boot/efi/EFI/centos/grub.cfg"
+  mkdir -p "$(dirname "$cfg")"
+  printf 'set timeout=5\n' > "$cfg"
+
+  run grub2_mkconfig_efi "$cfg"
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"no kernel entry and no blscfg"* ]]
+}
+
+# The ESP config must not be generated at all when the pipeline did not create the
+# ESP: on Rocky the file already exists and works, and rewriting it would replace
+# the distro's own three-line pointer with a generated config. The guard is
+# ESP_UUID, which customize-image.sh only sets on the runs that created the ESP.
+@test "no ESP config is written when the pipeline did not create the ESP" {
+  grub_setup
+  unset ESP_UUID
+  # makes the hook's write path fail loudly if it is ever reached
+  mkdir -p "$ROOT/boot/efi/EFI/centos"
+  grub2_mkconfig_efi() { echo "reached the ESP writer" >&2; return 1; }
+
+  run family_esp_write_config
+
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"ESP writer"* ]]
 }
 
 # --- SELinux must not prevent the first boot ---------------------------------

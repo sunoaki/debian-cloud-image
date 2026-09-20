@@ -93,7 +93,11 @@ jobs:
           sudo apt-get update
           # xfsprogs provides xfs_growfs, which the XFS roots (Rocky, CentOS)
           # need; e2fsprogs (resize2fs) is already present on the runner image.
-          sudo apt-get install -y qemu-utils cloud-guest-utils wget xfsprogs
+          # dosfstools provides mkfs.vfat, which formats a newly created ESP. It
+          # is on the runner image today, but naming it here means a runner image
+          # change turns into an install rather than "mkfs.vfat: command not
+          # found" halfway through a build.
+          sudo apt-get install -y qemu-utils cloud-guest-utils wget xfsprogs dosfstools
 
       # Split in two so the ~600 MB image can be cached on its *checksum*: the
       # checksum has to be fetched before a stable cache key exists, and a hit
@@ -204,6 +208,9 @@ jobs:
           CLOUD_CFG: ${{ matrix.cloud_cfg }}
           SOURCES_FORMAT: ${{ matrix.sources_format }}
           FAMILY: ${{ matrix.family }}
+          # Only entries that ask for one get an ESP; every other distro here
+          # already ships one, which the script detects from the partition table.
+          EFI_ESP: ${{ matrix.efi_esp }}
           PACKAGES_FILE: ${{ matrix.packages_file }}
           SYSCTL_FILE: ${{ matrix.sysctl_file }}
         run: sudo -E bash scripts/customize-image.sh
@@ -259,11 +266,18 @@ jobs:
           # on a stock Rocky 9 image: default model -> kernel panic, -cpu max ->
           # login prompt.
 
-          # Firmware is chosen from the partition type GUIDs that
+          # Firmware is chosen from the partition *types* that
           # scripts/customize-image.sh read while the disk was attached, because
           # a qcow2 cannot be probed directly -- sfdisk reads the container and
           # reports no partition table. Booting with the wrong firmware fails for
           # reasons unrelated to the image being broken.
+          #
+          # The value already accounts for images the pipeline gives an ESP at
+          # build time: it reports efi as soon as one was created, so a CentOS 7
+          # image that now carries both an ESP and its original MBR path is
+          # boot-tested on UEFI. Only one firmware can be boot-tested per run, so
+          # the BIOS path of such an image is covered by the uefi_esp bats tests
+          # and by a local SeaBIOS boot rather than by this job.
           if [ "${FIRMWARE:-bios}" = "efi" ]; then
             firmware=uefi
             # OVMF's variable store must be writable (the firmware persists NVRAM

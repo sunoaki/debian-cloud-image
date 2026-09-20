@@ -94,6 +94,100 @@ bc13c2ff-59e6-4262-a352-b275fd6f7172')" = "efi" ]
   [ -z "$(layout_firmware '')" ]
 }
 
+# The MBR spelling. partx -o TYPE prints a one-byte type code as hex on a DOS
+# label, so a real ESP on an MBR disk arrives as `0xef` and not as the GPT GUID.
+# Matching only the GUID reported such an image as BIOS, which would have boot
+# tested a CentOS 7 image that does have an ESP with the wrong firmware.
+@test "an MBR EFI system partition type selects efi" {
+  [ "$(layout_firmware '0x83
+0xef')" = "efi" ]
+}
+
+@test "an MBR type code that is not 0xef selects bios" {
+  [ "$(layout_firmware '0x83
+0x8e')" = "bios" ]
+}
+
+# 0xef must match as a whole value: a prefix match would make 0xef0 an ESP, and
+# more realistically a 0xef byte must not be found inside a longer hex string.
+@test "a longer hex value beginning with 0xef is not an ESP" {
+  [ "$(layout_firmware '0xeff0')" = "bios" ]
+}
+
+# --- ESP creation plan -----------------------------------------------------
+
+# The stock CentOS 7 image has a single MBR partition and no ESP, so this is the
+# case the whole efi_esp path exists for.
+@test "an entry asking for an ESP on an image without one gets a size" {
+  [ "$(layout_esp_plan 1 '0x83')" = "204800" ]
+}
+
+@test "the yaml's true spelling also asks for an ESP" {
+  [ "$(layout_esp_plan true '0x83')" = "204800" ]
+}
+
+# Every other entry in the matrix already ships an ESP; creating a second one
+# would leave two, and the bootloader would only ever be on the distro's own.
+@test "an image that already has a GPT ESP gets no second one" {
+  [ -z "$(layout_esp_plan 1 '0fc63daf-8483-4772-8e79-3d69d8477de4
+c12a7328-f81f-11d2-ba4b-00a0c93ec93b')" ]
+}
+
+@test "an image that already has an MBR ESP gets no second one" {
+  [ -z "$(layout_esp_plan 1 '0x83
+0xef')" ]
+}
+
+@test "an entry that did not ask for an ESP gets none" {
+  [ -z "$(layout_esp_plan '' '0x83')" ]
+  [ -z "$(layout_esp_plan false '0x83')" ]
+  # a typo must leave the image as it is, not create one of an unvalidated size
+  [ -z "$(layout_esp_plan yes '0x83')" ]
+}
+
+@test "the default when efi_esp is absent is not to create an ESP" {
+  [ -z "$(layout_esp_plan '' '0x83')" ]
+}
+
+# --- ESP geometry ----------------------------------------------------------
+
+# The ESP is placed so it ends on the disk's last sector and starts on a 1MiB
+# boundary. These numbers are the ones measured on the lab image (total 33761280
+# sectors, 204800 wanted): the run of sectors from 33556480 to 33761279.
+@test "the ESP ends on the last sector and starts 1MiB-aligned" {
+  [ "$(layout_esp_geometry 33761280 204800)" = "33556480 33761279" ]
+}
+
+@test "the ESP's requested size is what separates start and end" {
+  local start end
+  read -r start end <<<"$(layout_esp_geometry 33761280 204800)"
+  [ $((end - start + 1)) -eq 204800 ]
+}
+
+# The tail between the aligned start and the disk end is alignment slack. It is
+# 1MiB at most, which is why customize-image.sh resizes by 101MiB rather than
+# 100MiB to still get a full 100MiB partition.
+@test "the alignment slack is less than one alignment unit" {
+  local start end
+  read -r start end <<<"$(layout_esp_geometry 33761280 204800)"
+  [ $((end + 1 - (start + 204800))) -lt 2048 ]
+}
+
+@test "a disk that ends exactly on the wanted size yields a start of zero" {
+  [ "$(layout_esp_geometry 204800 204800)" = "0 204799" ]
+}
+
+@test "the start is always a multiple of 2048" {
+  local total start
+  for total in 33761280 33800000 34000001; do
+    read -r start _ <<<"$(layout_esp_geometry "$total" 204800)"
+    [ $((start % 2048)) -eq 0 ] || {
+      echo "start $start is not 1MiB-aligned for total $total"
+      return 1
+    }
+  done
+}
+
 # --- slot count (the original incident) ------------------------------------
 
 @test "a hidden partition is detected as insufficient slots" {

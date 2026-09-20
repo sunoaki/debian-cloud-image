@@ -17,6 +17,9 @@ SRC_IMAGE="${SRC_IMAGE:-${IMAGE_NAME:-}}"
 : "${SOURCES_FORMAT:?SOURCES_FORMAT is required}"
 : "${PACKAGES_FILE:-}" # defaults to config/cloud-image-packages.txt in repo root
 : "${SYSCTL_FILE:-}"   # defaults to config/cloud-image-sysctl.conf in repo root
+# efi_esp comes from config/images.yaml; only entries that ask for an EFI system
+# partition set it to true. Left unset it means "do not create one".
+: "${EFI_ESP:-}"
 [ -f "$SRC_IMAGE" ] || { echo "image not found: $SRC_IMAGE" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || { echo "must run as root (workflow: sudo -E bash scripts/customize-image.sh)" >&2; exit 1; }
@@ -39,6 +42,8 @@ BOOTDEV=
 ROOTDEV=
 ATTACHED_NBD=false
 RESOLV_BACKUP=
+ESPDEV=
+ESP_SIZE_SECTORS=
 
 cleanup() {
   set +e
@@ -49,6 +54,7 @@ cleanup() {
   mountpoint -q "$MNT/proc" && umount "$MNT/proc"
   mountpoint -q "$MNT/dev/pts" && umount "$MNT/dev/pts"
   mountpoint -q "$MNT/dev" && umount "$MNT/dev"
+  mountpoint -q "$MNT/boot/efi" && umount "$MNT/boot/efi"
   mountpoint -q "$MNT/boot" && umount "$MNT/boot"
   mountpoint -q "$MNT" && umount "$MNT"
   if [ "$ATTACHED_NBD" = "true" ]; then
@@ -61,12 +67,23 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Grow the virtual disk: stock cloud images ship tiny (2-3G) roots and apt
-# installs for our package list run out of space (Ubuntu 22.04). The root
-# partition ends after every other partition on the disk (Ubuntu >= 24.04 puts
-# EFI and /boot *before* it), so the appended space sits directly after root and
-# growpart + resize2fs can extend it.
+# Grow the virtual disk: stock cloud images ship tiny (2-3G) roots and package
+# installs for our list run out of space (Ubuntu 22.04). The root partition ends
+# after every other partition on the disk (Ubuntu >= 24.04 puts EFI and /boot
+# *before* it), so the appended space sits directly after root and growpart plus
+# the filesystem grow can extend it.
 qemu-img resize "$SRC_IMAGE" +4G
+
+# An entry that asks for an EFI system partition (config/images.yaml efi_esp)
+# gets one appended at the end of the disk. Ask for 101MiB to get a 100MiB
+# partition: the ESP is aligned down to a 1MiB boundary, which pushes its start
+# above where it would otherwise be and would leave the partition short of 100MiB.
+# layout_esp_geometry turns the resulting sector count into the exact start and
+# end. An empty type list is the right input here: this runs before the disk is
+# attached, and the point is only to reserve room when some entry asked for one.
+if [ -n "$(layout_esp_plan "${EFI_ESP:-}" "")" ]; then
+  qemu-img resize "$SRC_IMAGE" +101M
+fi
 
 # Attach the image as a block device. qemu-nbd reads qcow2 directly; fall back
 # to losetup + raw conversion if the nbd module is missing.
@@ -129,17 +146,40 @@ if ! layout_slots_sufficient "$kernel_parts" "$table_parts"; then
   exit 1
 fi
 
-# Record the partition type GUIDs now that the disk is attached: the advisory
-# boot test in the workflow needs them to choose BIOS or UEFI firmware, and a
-# qcow2 cannot be probed directly (sfdisk reads the container, not the table).
-# partx reads the on-disk table itself; lsblk PARTTYPE depends on udev data that
-# is not reliably populated for nbd devices and returned nothing on a CI run.
+# Record the partition *types* now that the disk is attached: the advisory boot
+# test in the workflow needs them to choose BIOS or UEFI firmware, and a qcow2
+# cannot be probed directly (sfdisk reads the container, not the table). partx
+# reads the on-disk table itself; lsblk PARTTYPE depends on udev data that is not
+# reliably populated for nbd devices and returned nothing on a CI run.
+#
+# These values double as the input to the ESP decision below: the same read tells
+# us both whether an ESP is already there and what size to create when it is not.
 PARTTYPES=$(partx --show --noheadings -o NR,TYPE "$DISKDEV" 2>/dev/null | awk '{print $2}' | grep -v '^$' || true)
-FIRMWARE=$(layout_firmware "$PARTTYPES")
-if [ -n "$FIRMWARE" ]; then
-  echo "Firmware for boot test: $FIRMWARE (from $(printf '%s\n' "$PARTTYPES" | wc -l) partition type GUIDs)"
+ESP_SIZE_SECTORS=$(layout_esp_plan "${EFI_ESP:-}" "$PARTTYPES")
+
+# Record the firmware for the boot test in the workflow, folding in the ESP this
+# run is about to create rather than only the one the image arrived with:
+#
+#   * The types read above describe the image as it shipped, and a CentOS 7 image
+#     has no ESP yet. Reporting that initial state would boot-test a
+#     two-firmware image on BIOS alone, which is the path that already worked.
+#   * An ESP being created means the image will boot UEFI, so efi is the right
+#     value to test.
+#
+# The chroot is a separate question and no longer reads this value: rhel.sh pins
+# each generated config to the firmware that reads it (see grub2_mkconfig_bios and
+# grub2_mkconfig_efi), because on a dual-firmware image one value cannot describe
+# both files. Passing FIRMWARE in would only let the *runner's* platform leak back
+# in, which is what produced `linuxefi` in a BIOS-only image's config.
+if [ -n "$ESP_SIZE_SECTORS" ]; then
+  FIRMWARE=efi
 else
-  echo "WARN: could not read partition type GUIDs; boot test will fall back to BIOS" >&2
+  FIRMWARE=$(layout_firmware "$PARTTYPES")
+fi
+if [ -n "$FIRMWARE" ]; then
+  echo "Firmware for boot test: $FIRMWARE (from $(printf '%s\n' "$PARTTYPES" | wc -l) partition type value(s))"
+else
+  echo "WARN: could not read partition types; boot test will fall back to BIOS" >&2
 fi
 # Hand the value to later workflow steps through $GITHUB_ENV (the file only
 # exists under GitHub Actions; a local run simply skips this).
@@ -172,13 +212,64 @@ if [ -z "$ROOTDEV" ]; then
   exit 1
 fi
 
+# Create the EFI system partition here, at the *end* of the disk and *before*
+# root is grown. Neither choice is free, and both were measured on the lab image
+# (total 33761280 sectors, ESP 204800 sectors):
+#
+#   * End of the disk, not directly behind root. growpart only ever extends a
+#     partition as far as the next one's start, so an ESP placed immediately after
+#     root caps root at its stock size and the package install then fails with
+#     ENOSPC - a symptom that names nothing about its cause.
+#   * Before growpart, not after. growpart rounds its result down to a whole
+#     number of 1MiB units, so on this disk it put root's end at 33759231 - past
+#     the 33556480 the ESP has to start at. `sfdisk --append` then failed with "no
+#     free sectors available" and the image kept its single stock partition, with
+#     no ESP at all. Creating the ESP first makes growpart stop exactly at its
+#     start instead (root ends at 33556479, flush against the ESP), so the whole
+#     gap still goes to root.
+if [ -n "$ESP_SIZE_SECTORS" ]; then
+  TOTAL_SECTORS=$(blockdev --getsz "$DISKDEV")
+  read -r ESP_START ESP_END < <(layout_esp_geometry "$TOTAL_SECTORS" "$ESP_SIZE_SECTORS")
+  ESP_PARTNUM=$((table_parts + 1))
+  echo "Creating a $((ESP_SIZE_SECTORS / 2048))MiB ESP as partition $ESP_PARTNUM (sectors $ESP_START-$ESP_END)"
+  # --append adds a single partition to the existing table without rewriting the
+  # rest of it, which is what we want: the entries already there are left exactly
+  # as the image shipped them. `type=ef` is the MBR EFI System type byte; an MBR
+  # table has nowhere to store a GUID, and on MBR this byte is the only thing that
+  # marks a partition as an ESP. (A GPT image would need its GUID instead; no
+  # entry in the matrix does, and layout_esp_plan skips images that already have
+  # an ESP, so this is MBR-only by construction.)
+  printf 'start=%s, size=%s, type=ef\n' "$ESP_START" "$ESP_SIZE_SECTORS" |
+    sfdisk --no-reread --append "$DISKDEV"
+  partprobe "$DISKDEV" || true
+  ESPDEV=$DISKDEV$ESP_PARTNUM
+  wait_for_partitions "$((table_parts + 1))" || {
+    echo "Timed out waiting for the new ESP node $ESPDEV to appear" >&2
+    exit 1
+  }
+  # mkfs.vfat is on the runner, not in the image: the stock CentOS 7 image has no
+  # dosfstools, and the chroot cannot format the ESP for that reason. Formatting
+  # from the host also avoids mounting the image's own /boot/efi before its
+  # bootloader has been installed. The workflow installs dosfstools explicitly
+  # rather than relying on the runner image happening to carry it.
+  mkfs.vfat -F 32 -n EFI "$ESPDEV" >/dev/null
+  # Record how to reach it on the finished system: the ESP has no directory in
+  # the image yet, and the chroot hook appends this line to /etc/fstab so the
+  # kernel updates of a running VM refresh /boot/efi too.
+  ESP_UUID=$(blkid -o value -s UUID "$ESPDEV")
+  [ -n "$ESP_UUID" ] || {
+    echo "Could not read a filesystem UUID from the new ESP $ESPDEV" >&2
+    exit 1
+  }
+  echo "ESP ready: $ESPDEV UUID=$ESP_UUID"
+fi
+
 # Grow the root filesystem to fill the space added by qemu-img resize. The
 # recipe depends on the filesystem, and so does *when* it runs:
 #   ext4 (Debian/Ubuntu) - resize2fs acts on the device and must run unmounted.
 #   xfs  (Rocky/CentOS)  - xfs_growfs acts through the mountpoint and the
 #                          filesystem must be mounted (man 8 xfs_growfs).
-# growpart always runs first because it edits the partition table either way, and
-# it legitimately returns non-zero when the partition is already maximal.
+# growpart legitimately returns non-zero when the partition is already maximal.
 ROOTNUM=$(echo "$ROOTDEV" | grep -oE '[0-9]+$')
 growpart "$DISKDEV" "$ROOTNUM" || true
 
@@ -202,6 +293,14 @@ mkdir -p "$MNT"
 mount "$ROOTDEV" "$MNT"
 if [ -n "$BOOTDEV" ]; then
   mount "$BOOTDEV" "$MNT/boot"
+fi
+# Mount the new ESP so the chroot can install the EFI bootloader onto it. This is
+# a real mount of the image's own filesystem, so the files the chroot writes are
+# the ones the firmware will read; the payloads are copied from the image's own
+# RPMs rather than only from this runner.
+if [ -n "$ESPDEV" ]; then
+  mkdir -p "$MNT/boot/efi"
+  mount "$ESPDEV" "$MNT/boot/efi"
 fi
 
 if [ "$GROW_RECIPE" = "mounted" ]; then
@@ -278,13 +377,21 @@ install -m 0644 "$SCRIPT_DIR/family/"*.sh "$MNT/tmp/family/"
 # `env VAR=...`: CentOS 7 ships coreutils 8.22, and while its `env` handles the
 # plain form fine, exporting keeps the construct readable and side-steps the
 # question entirely.
-# FIRMWARE is needed inside the chroot too: grub2-mkconfig picks its platform
-# from what it can see, and inside our chroot that is the *runner's* view, not the
-# image's. It generated `linuxefi` for a BIOS-only CentOS 7 image, which GRUB then
-# could not run ("error: can't find command `linuxefi'"), leaving an image that
-# could not boot. Passing the firmware we already detected from the partition
-# table lets the family hook pin the generated config to the real platform.
-export SOURCES_FILE CLOUD_CFG SOURCES_FORMAT FAMILY FIRMWARE
+#
+# FIRMWARE is deliberately *not* passed into the chroot. It used to be, back when
+# one value described the whole image; with an ESP and an MBR path in the same
+# image it cannot, and the family hooks pin each config file to the firmware that
+# reads it instead (see grub2_mkconfig_bios / grub2_mkconfig_efi in rhel.sh). What
+# is left of it is a boot-test value for the workflow, handed over through
+# $GITHUB_ENV above.
+export SOURCES_FILE CLOUD_CFG SOURCES_FORMAT FAMILY
+# ESP_UUID travels in as the value to write into /etc/fstab: inside the chroot the
+# ESP's device node is the runner's (/dev/nbd0p2), which is not the name the image
+# will use, and fstab must name a stable filesystem UUID anyway. The image's own
+# /etc/fstab has no ESP entry at all, so without this a kernel update on a running
+# VM would rewrite /boot/efi nowhere and the firmware would keep reading the old
+# payload.
+export ESP_UUID="${ESP_UUID:-}"
 export PACKAGES_FILE=/tmp/cloud-image-packages.txt
 export SYSCTL_FILE=/tmp/cloud-image-sysctl.conf
 export FAMILY_DIR=/tmp/family

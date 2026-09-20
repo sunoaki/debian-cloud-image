@@ -16,6 +16,12 @@
 # frozen: true builds only on a manual workflow_dispatch, never on the schedule.
 #   For a release whose upstream content can no longer change, a weekly rebuild
 #   would produce a byte-identical image and a redundant release tag.
+# efi_esp: true gives an image an EFI system partition that its upstream source
+#   does not have, so it can be booted with either firmware. It is meant for
+#   entries that are BIOS-only upstream and cannot be fixed any other way; every
+#   other distro here already ships an ESP, which the pipeline detects from the
+#   partition table instead of trusting this field. Nothing is created unless the
+#   entry says so.
 images:
   - distro: debian
     codename: trixie
@@ -134,4 +140,10 @@ images:
     packages_file: config/packages-rpm-centos7.txt
     sysctl_file: config/sysctl-rhel.conf
     frozen: true
+    # Upstream's CentOS 7 GenericCloud image has never existed in a UEFI variant:
+    # it carries a single MBR partition and no ESP at all, and there is no other
+    # source to take one from. The pipeline therefore appends a 100MiB ESP and the
+    # rhel family installs grub2-efi-x64 plus shim-x64 onto it from the vault. Both
+    # firmware paths then boot: the BIOS path through MBR is untouched.
+    efi_esp: true
 
